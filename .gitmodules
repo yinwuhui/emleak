@@ -1,0 +1,6 @@
+[submodule "bcc"]
+	path = bcc
+	url = https://github.com/iovisor/bcc.git
+[submodule "libbpf-bootstrap"]
+	path = libbpf-bootstrap
+	url = https://github.com/libbpf/libbpf-bootstrap.git
