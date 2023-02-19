@@ -1,29 +1,47 @@
+import csv
+import datetime
 import pygal
+import os
 
-# 从文件中读取数据
-with open('mleakstatics.txt', 'r') as f:
+# 预处理
+with open('mleakstatics.csv', 'r') as f:
     lines = f.readlines()
 
-# 将数据按列分割
-data = [list(map(int, line.strip().split())) for line in lines]
+last_line = lines.pop()  # 移除最后一行
+lines.insert(0, last_line)  # 插入到第一行
 
-# 获取横坐标
-x_labels = [row[0] for row in data][1:]
+with open('tmp_mleakstatics.csv', 'w') as f:
+    f.writelines(lines)
 
-# 获取数据列的名称和值
-y_labels = {}
-for i, row in enumerate(data[0]):
-    if i > 0:
-        y_labels[row] = [d[i] for d in data[1:]]
 
-# 创建图表对象
-chart = pygal.Line()
-chart.title = 'memory statics'
+# 读取csv文件并将数据存入列表
+with open('tmp_mleakstatics.csv') as f:
+    reader = csv.reader(f)
+    headers = next(reader)
+    data = [[] for i in range(len(headers)-1)]
+    for row in reader:
+        for i in range(1, len(row)):
+            data[i-1].append(int(row[i]) if row[i] != '' else 0)
+
+# 将第一列的时间戳转换成datetime类型的值
+x_labels = []
+for timestamp in map(int, data[0]):
+    dt = datetime.datetime.fromtimestamp(timestamp)
+    x_labels.append(dt.strftime('%Y-%m-%d %H:%M:%S'))
+
+# 创建折线图对象
+chart = pygal.Line(x_label_rotation=1024)
+chart.title = 'Memory Statics'
+
+# 添加数据
+for i in range(1, len(headers)):
+    chart.add(headers[i], data[i-1])
+
+# 设置x轴标签
 chart.x_labels = x_labels
 
-# 添加数据列
-for label, values in y_labels.items():
-    chart.add(str(label), values)
+# 输出svg格式的图表
+chart.render_to_file('mleakstatics.svg')
 
-# 保存图表为SVG格式
-chart.render_to_file('mleakstaticsoutput.svg')
+os.remove("tmp_mleakstatics.csv")
+

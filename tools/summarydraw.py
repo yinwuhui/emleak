@@ -1,24 +1,22 @@
-import plotly.express as px
-
-# 构建数据
 import csv
+import pygal
 
-data = []
-with open('mleaksummary.csv', 'r') as f:
-    reader = csv.reader(f)
-    for row in reader:
-        stackname, total, times = row
-        total = int(total)
-        times = int(times)
-        data.append({"stackname": stackname, "total": total, "times": times})
+with open('mleaksummary.csv', 'r') as csvfile:
+    reader = csv.reader(csvfile)
+    data = list(reader)
 
+# 读取数据
+labels = [row[0] for row in data]
+total = [int(row[1]) for row in data]
+times = [int(row[2]) for row in data]
 
-# 使用Plotly Express创建柱状图
-fig = px.bar(data, x="stackname", y=["total", "times"],
-             color_discrete_sequence=["#1f77b4", "#ff7f0e"],
-             hover_data=["stackname"],
-             labels={"value": "Count", "variable": "Category"})
+# 创建柱状图
+bar_chart = pygal.Bar()
+bar_chart.title = 'All stack malloc memry total and times'
+bar_chart.x_labels = labels
+bar_chart.add('total', total)
+bar_chart.add('times', times)
 
-# 将绘图保存为SVG文件
-fig.write_image("summaryout.svg")
+# 输出图表
+bar_chart.render_to_file('mleaksummary.svg')
 
