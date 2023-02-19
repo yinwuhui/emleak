@@ -146,7 +146,7 @@ OPTS:
         改为：#include "vmlinux_601.h"
 
     #获取代码
-    git clone --recurse-submodules https://github.com/yinwuhui/memleak-visual.git
+    git clone --recurse-submodules https://github.com/yinwuhui/emleak.git
 
     #编译bcc静态开发库libcc.a
     cd bcc
