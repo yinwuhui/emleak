@@ -422,6 +422,13 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 {
 	/*If it is a name, wait until the process is checked before initializing*/
 	if(paras->pid != 0){
+		int ret = proc_syms_load(paras->pid);
+		if(ret == 0){
+			printf("Loaded successfully, pid = %ld...\n", paras->pid);
+		}else{
+			printf("Loaded failed, pid = %ld!\n", paras->pid);
+		}
+
 		outfiles_init(paras->pid, paras);
 	}
 
@@ -496,13 +503,13 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		skel->bss->g_emleak_prog.prog_state = PROG_START_STATE;
 		int pid = skel->bss->g_emleak_prog.prog_pid;
 		printf("touch ok pid = %d.\n", pid);
+
 		int ret = proc_syms_load(pid);
 		if(ret == 0){
-			printf("Loaded successfully...\n");
+			printf("Loaded successfully, pid = %d...\n", pid);
 		}else{
-			printf("Loaded failed !\n");
+			printf("Loaded failed, pid = %d!\n", pid);
 		}
-
 		outfiles_init(pid, &cmdparas);
 	}
 
