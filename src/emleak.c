@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 #include "uthash.h"
 #include "common.h"
@@ -38,12 +39,15 @@ struct emleakpara cmdparas =
 		{ 0, "a.out", 10, STACK_OUTFILE_NAME, SUMMARY_OUTFILE_NAME, STATICS_OUTFILE_NAME};
 
 int g_exiting = 0;
+volatile int g_signal = 0;
 
 static int g_sizes_fd;
 static int g_allocs_fd;
 static int g_memptrs_fd;
 static int g_stack_traces_fd;
 static int g_combined_allocs_fd;
+
+pthread_mutex_t g_perf_event_mutex;  /*Avoid  kernel event and user sigfun printing at the same time*/
 
 static const char *__doc__ = 
 "usage: %s [OPTS] \n"
@@ -229,7 +233,8 @@ int outfiles_init(int pid, struct emleakpara *para)
 {
 	char path[MAXFILELEN/2] = {0}; 
     struct stat sb;
-	FILE* fp;
+	FILE* fp = NULL;
+	memset(&sb, 0x00, sizeof(sb));
 
 	if(para == NULL)
 	{
@@ -452,11 +457,6 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 	return ;
 }
 
-static void all_mem_statistics_output(void)
-{
-	print_outstanding(cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile, 1);
-}
-
 static void old_environment_clean(void)
 {
 	__u64 prev_key = 0, key = 0;
@@ -492,11 +492,17 @@ static void old_environment_clean(void)
 static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
 	const struct event_t *msg = data;
+
+	pthread_mutex_lock(&g_perf_event_mutex);
+	if(skel->bss->g_emleak_prog.prog_state == PROG_IDEL_STATE){
+		pthread_mutex_unlock(&g_perf_event_mutex);
+		return ;
+	}
 	
 	if(msg->old_state == PROG_START_STATE 
 	   	&& msg->new_state == PROG_END_STATE)
 	{
-		all_mem_statistics_output();
+		print_outstanding(cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile, 1);
 
 		old_environment_clean();
 		skel->bss->g_emleak_prog.prog_state = PROG_IDEL_STATE;
@@ -516,6 +522,8 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		}
 		outfiles_init(pid, &cmdparas);
 	}
+
+	pthread_mutex_unlock(&g_perf_event_mutex);
 
 	return ;
 }
@@ -546,30 +554,52 @@ void* print_thread(void* arg)
 		return NULL;
 	}
     event.events = EPOLLIN | EPOLLET;
-
 	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event.data.fd, &event);
     if(ret < 0) {
         printf("epoll_ctl Add fd:%d error, Error:[%d:%s]", event.data.fd, errno, strerror(errno));
         return NULL;
     }
 
+	int times_index = 0;
 	while(1){
-		ret = epoll_wait(epoll_fd, events, sizeof(events)/sizeof(struct epoll_event), interval*1000);
+		ret = epoll_wait(epoll_fd, events, sizeof(events)/sizeof(struct epoll_event), 1000);
+		times_index++;
+
+		if(g_signal){
+			struct event_t new_msg;
+			new_msg.pid = skel->bss->g_emleak_prog.prog_pid;
+			new_msg.msg_type = 0;
+			new_msg.old_state = skel->bss->g_emleak_prog.prog_state;
+			new_msg.new_state = PROG_END_STATE;
+
+			handle_perf_event(NULL, 0 , &new_msg, sizeof(new_msg));
+
+			printf("Exporting call stack data successfully. outfile[%s,%s,%s]\n", 
+			            cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile);
+			close(event.data.fd);
+			exit(0);
+		}
+
+		if(times_index < interval){
+			continue;
+		}
 
 		if(skel->bss->g_emleak_prog.prog_state == PROG_START_STATE)
 		{
 			print_outstanding(NULL, NULL, cmdparas.statisticalfile, 0);
 		}
+		times_index = 0;
 	}
 }
 
 void emleak_signal(int sig)
 {
-	skel->bss->g_emleak_prog.prog_state = PROG_END_STATE;
+	printf("start process emleak_signal. sig = %d.\n", sig);
 
-	all_mem_statistics_output();
-	printf("Exporting call stack data successfully. outfile[%s]\n", cmdparas.stackfile);
-	exit(1);
+	/*Notification print thread*/
+	g_signal = sig;
+
+	return ;
 }
 
 int main(int argc, char **argv)
@@ -577,6 +607,8 @@ int main(int argc, char **argv)
 	int err;
 	int ret = 0;
 	struct perf_buffer *pb = NULL;
+
+	pthread_mutex_init(&g_perf_event_mutex, NULL);
 
 	ret = cmd_opts_analytic(argc, argv, &cmdparas);
 	if(ret < 0){

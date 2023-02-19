@@ -44,7 +44,7 @@ struct combined_alloc_info_t {
 
 struct prog_infor_t {
         u64 prog_pid;                          /**< 进程pid*/
-        enum progstate_e prog_state;           /**< 进程状态*/
+        volatile enum progstate_e prog_state;  /**< 进程状态*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/
