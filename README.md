@@ -74,9 +74,9 @@ OPTS:
 
     mleakstacks.txt ： 保存进程中所有内存申请释放相关的堆栈信息;
 
-    mleaksummary.txt： 保存进程最终的统计信息，包含callstack，内存总量与申请次数;
+    mleaksummary.csv 保存进程最终的统计信息，包含callstack，内存总量与申请次数;
 
-    mleakstatics.txt： 保存指定周期（默认10s）进程的内存摘要信息;
+    mleakstatics.csv： 保存指定周期（默认10s）进程的内存摘要信息;
 
 **数据可视化：**
 

@@ -9,7 +9,7 @@
 
 #define STACK_OUTFILE_NAME "mleakstacks.txt"
 #define SUMMARY_OUTFILE_NAME "mleaksummary.csv"
-#define STATICS_OUTFILE_NAME "mleakstatics.txt"
+#define STATICS_OUTFILE_NAME "mleakstatics.csv"
 
 struct emleakpara{
     unsigned long pid;                     /**< 进程 pid*/

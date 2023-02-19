@@ -286,11 +286,38 @@ int outfiles_init(int pid, struct emleakpara *para)
 }
 
 struct statistical g_statistical = {.stack_num = 1};
+static void print_statistical_head(char *outfilename)
+{
+	FILE *fp = NULL;
+	char buffer[1024]  = {0};
+	memset(buffer, 0x0, sizeof(buffer));
+
+	fp = fopen(outfilename,"a+");
+	if(!fp){
+		printf("Failed to open statistical outfile. filename = %s.\n", outfilename);
+		return ;
+	}
+	
+	for(int i = 0; i < g_statistical.stack_num; i++)
+	{
+		sprintf(buffer + strlen(buffer), "%d,", g_statistical.stack_id[i]);
+		if(i > 50){
+			fwrite(buffer, 1, strlen(buffer), fp);
+			memset(buffer, 0x0, sizeof(buffer));
+		}
+	}
+	sprintf(buffer + strlen(buffer), "\n");
+	fwrite(buffer, 1, strlen(buffer), fp);
+
+	fclose(fp);
+
+	return ;
+}
+
 static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 {
 	FILE *fp = NULL;
 	char buffer[1024]  = {0};
-	int isnewstack = 0;
 	int index_summry = 0;
 	struct stack_node *tmpnode = NULL;
 
@@ -302,7 +329,6 @@ static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next)
 	{
 		if(g_statistical.stack_hash[tmpnode->stack_id] == 0){
-			isnewstack  = 1;
 			g_statistical.stack_hash[tmpnode->stack_id] = g_statistical.stack_num;
 			index_summry = g_statistical.stack_num;
 			g_statistical.stack_num++;
@@ -312,32 +338,6 @@ static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 
 		g_statistical.stack_id[index_summry] = tmpnode->stack_id;
 		g_statistical.stack_summry[index_summry] = tmpnode->memsum;
-	}
-
-	/*update stack id*/
-	if(isnewstack){
-		memset(buffer, 0x0, sizeof(buffer));
-		fp = fopen(outfilename,"r+");
-		if(!fp){
-			printf("Failed to open statistical outfile. filename = %s.\n", outfilename);
-			return ;
-		}
-		
-		for(int i = 0; i < g_statistical.stack_num; i++)
-		{
-			sprintf(buffer + strlen(buffer), "%d ", g_statistical.stack_id[i]);
-			if(i > 50){
-				fwrite(buffer, 1, strlen(buffer), fp);
-				memset(buffer, 0x0, sizeof(buffer));
-			}
-		}
-		sprintf(buffer + strlen(buffer), "\n");
-
-		fseek(fp, 0, SEEK_SET);
-		fwrite(buffer, 1, strlen(buffer), fp);
-		fseek(fp, 0, SEEK_END);
-
-		fclose(fp);
 	}
 
 	if(g_statistical.stack_num <= 1){
@@ -353,7 +353,7 @@ static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 
 	for(int i = 0; i < g_statistical.stack_num; i++)
 	{
-		sprintf(buffer + strlen(buffer), "%d ", g_statistical.stack_summry[i]);
+		sprintf(buffer + strlen(buffer), "%d,", g_statistical.stack_summry[i]);
 		if(i > 50){
 			fwrite(buffer, 1, strlen(buffer), fp);
 			memset(buffer, 0x0, sizeof(buffer));
@@ -384,7 +384,7 @@ void add_stack_node(struct stack_node **stackmaps, int stack_id, int memsize) {
 	s->memsum += memsize;
 }
 
-void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile)
+void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
 {
 	__u64 prev_key, key;
 	struct alloc_info_t alloc_info;
@@ -409,6 +409,10 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	print_stacks(&stackmaps, stacksfile);
 	print_summary(&stackmaps, summaryfile);
 	print_statistical(&stackmaps, statisticalfile);
+	if(islastprint)
+	{
+		print_statistical_head(statisticalfile);
+	}
 
 	HASH_CLEAR(hh, stackmaps);
 }
@@ -450,7 +454,7 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 
 static void all_mem_statistics_output(void)
 {
-	print_outstanding(cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile);
+	print_outstanding(cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile, 1);
 }
 
 static void old_environment_clean(void)
@@ -554,7 +558,7 @@ void* print_thread(void* arg)
 
 		if(skel->bss->g_emleak_prog.prog_state == PROG_START_STATE)
 		{
-			print_outstanding(NULL, NULL, cmdparas.statisticalfile);
+			print_outstanding(NULL, NULL, cmdparas.statisticalfile, 0);
 		}
 	}
 }
