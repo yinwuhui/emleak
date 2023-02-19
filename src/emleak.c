@@ -558,6 +558,7 @@ void emleak_signal(int sig)
 
 	all_mem_statistics_output();
 	printf("Exporting call stack data successfully. outfile[%s]\n", cmdparas.stackfile);
+	exit(1);
 }
 
 int main(int argc, char **argv)
