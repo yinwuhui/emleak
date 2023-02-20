@@ -94,11 +94,13 @@ OPTS:
 
 **数据可视化：**
 
-    tools文件夹中存在两个python脚本:
+    tools文件夹中存在三个脚本:
 
     statisticsdraw.py：将mleakstatics.txt数据转换为折线图，从而分析内存全生命周期，所有的内存使用情况
 
     summarydraw.py：将mleaksummary.txt数据转换为柱状图，直观获取每个stack的最终的内存消耗情况
+    
+    flamegraph.pl：将堆栈信息绘制为火焰图
 
 **操作步骤：**
     
