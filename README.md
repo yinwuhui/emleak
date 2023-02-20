@@ -149,8 +149,8 @@ OPTS:
 
 ## 工具链版本
 
-*   clang 9.0 以上
-*   clang backend: llvm 9.0 以上
+*   clang 12 以上
+*   clang backend: llvm 12 以上
 *   kernel config\:CONFIG\_DEBUG\_INFO\_BTF=y (可选)
 
 ## 编译
