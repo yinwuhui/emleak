@@ -6,7 +6,7 @@
 [![GitHub forks](https://img.shields.io/github/forks/yinwuhui/emleak)](https://github.com/yinwuhui/emleak)
 [![Github Version](https://img.shields.io/github/v/release/yinwuhui/emleak?display_name=tag\&include_prereleases\&sort=semver)](https://github.com/yinwuhui/emleak)
 
-### emleak(): 动态的跟踪进程的内存泄漏情况，对内存读写性能几乎无影响
+### emleak(): 动态的跟踪进程的内存泄漏情况，不影响内存的读写性能
 
 > **Note:**
 >
