@@ -132,6 +132,10 @@ OPTS:
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)
 
+## 关于性能损耗
+    对内存本身的读写性能没有影响，但会影响内存申请释放接口的性能。
+    性能报告还在测试中。。。
+
 ## 自行编译
 
 自行编译对编译环境有要求，参考**原理**章节的介绍。
