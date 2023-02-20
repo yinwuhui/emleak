@@ -124,7 +124,7 @@ OPTS:
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)
 
-总内存分布柱状图（横坐标为callstackID，红：内存总量，蓝：请次数）：
+总内存分布柱状图（横坐标为callstackID，红：内存总量，蓝：申请次数）：
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)
 
