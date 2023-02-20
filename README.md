@@ -72,7 +72,20 @@ OPTS:
 
 **输出为三个文本文件，每次捕获会使用进程pid创建新的文件夹，包含三个文件：**
 
-    mleakstacks.txt ： 保存进程中所有内存申请释放相关的堆栈信息;
+    mleakstacks.txt ： 保存进程中所有内存申请释放相关的堆栈信息，包括总内存大小和唯一的栈ID;
+    例如：
+        、、、、、、、、
+            15360 bytes allocated at callstack id 16325: 
+                valloc_node_get+0x1c;
+                memery_get_expand+0x8e;
+                thread_function+0x110;
+                start_thread+0x2f3;
+            27648 bytes allocated at callstack id 14214: 
+                malloc_node_get+0x1c;
+                memery_get_expand+0x46;
+                thread_function+0x110;
+                start_thread+0x2f3;
+        、、、、、、、、        
 
     mleaksummary.csv 保存进程最终的统计信息，包含callstack，内存总量与申请次数;
 
@@ -102,15 +115,15 @@ OPTS:
 
 **可视化输出：**
 
-调用栈火焰图：
+调用栈火焰图：（调用栈的宽度和总内存大小有关）
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)
 
-总内存分布柱状图：
+总内存分布柱状图（横坐标为callstackID，红：内存总量，蓝：请次数）：
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)
 
-内存变化趋势折线图：
+内存变化趋势折线图（横坐标为时间，纵坐标为时刻总量，每条折线对应一个callstackID）：
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)
 
