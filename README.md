@@ -33,7 +33,7 @@ eBPF `Uprobe`/`Kprobe`实现用户空间/内核空间的接口捕获，无需改
 
 ## 直接运行
 
-下载 [release](https://github.com/gojue/ecapture/releases) 的二进制包，可直接使用。
+下载 [release](https://github.com/yinwuhui/emleak/releases) 的二进制包，可直接使用。
 
 系统配置要求
 
