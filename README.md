@@ -19,6 +19,7 @@
 eBPF `Uprobe`/`Kprobe`实现用户空间/内核空间的接口捕获，无需改动原程序。
 
 *   基于eBPF技术，跟踪标准库的malloc/free相关的接口，以及内核的缺页事件，从而获取进程的内存使用情况。
+*   基于CO-RE BTF ，避免了运行需要依赖复杂编译环境与内核头文件 
 *   通过跟踪exec相关的系统调用，可以在生产环境持续的捕获进程的内存信息。
 *   通过Python pygal库将内存数据可视化为柱状图与折线图。
 
@@ -72,7 +73,20 @@ OPTS:
 
 **输出为三个文本文件，每次捕获会使用进程pid创建新的文件夹，包含三个文件：**
 
-    mleakstacks.txt ： 保存进程中所有内存申请释放相关的堆栈信息;
+    mleakstacks.txt ： 保存进程中所有内存申请释放相关的堆栈信息，包括总内存大小和唯一的栈ID;
+    例如：
+        、、、、、、、、
+            15360 bytes allocated at callstack id 16325: 
+                valloc_node_get+0x1c;
+                memery_get_expand+0x8e;
+                thread_function+0x110;
+                start_thread+0x2f3;
+            27648 bytes allocated at callstack id 14214: 
+                malloc_node_get+0x1c;
+                memery_get_expand+0x46;
+                thread_function+0x110;
+                start_thread+0x2f3;
+        、、、、、、、、        
 
     mleaksummary.csv 保存进程最终的统计信息，包含callstack，内存总量与申请次数;
 
@@ -80,37 +94,41 @@ OPTS:
 
 **数据可视化：**
 
-    tools文件夹中存在两个python脚本:
+    tools文件夹中存在三个脚本:
 
     statisticsdraw.py：将mleakstatics.txt数据转换为折线图，从而分析内存全生命周期，所有的内存使用情况
 
     summarydraw.py：将mleaksummary.txt数据转换为柱状图，直观获取每个stack的最终的内存消耗情况
+    
+    flamegraph.pl：将堆栈信息绘制为火焰图
 
 **操作步骤：**
     
 ```
     cp /tools/statisticsdraw.py ./outdir
     cp /tools/summarydraw.py ./outdir
+    cp /tools/flamegraph.pl ./outdir
 
     #生成总内存分布柱状图
-    python3 summarydraw.py
+    python3 ./summarydraw.py
     #生成内存增长折线图
-    python3 statisticsdraw.py
+    python3 ./statisticsdraw.py
     #生成调用栈火焰图
+    ./flamegraph.pl --color=mem --title="malloc() bytes Flame Graph" --countname=bytes < out.stacks > stacks.svg
     
 ```
 
 **可视化输出：**
 
-调用栈火焰图：
+调用栈火焰图：（调用栈的宽度和总内存大小有关）
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)
 
-总内存分布柱状图：
+总内存分布柱状图（横坐标为callstackID，红：内存总量，蓝：请次数）：
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)
 
-内存变化趋势折线图：
+内存变化趋势折线图（横坐标为时间，纵坐标为时刻总量，每条折线对应一个callstackID）：
 
 [![Example](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)
 
@@ -133,8 +151,8 @@ OPTS:
 
 ## 工具链版本
 
-*   clang 9.0 以上
-*   clang backend: llvm 9.0 以上
+*   clang 12 以上
+*   clang backend: llvm 12 以上
 *   kernel config\:CONFIG\_DEBUG\_INFO\_BTF=y (可选)
 
 ## 编译
