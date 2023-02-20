@@ -104,12 +104,14 @@ OPTS:
 ```
     cp /tools/statisticsdraw.py ./outdir
     cp /tools/summarydraw.py ./outdir
+    cp /tools/flamegraph.pl ./outdir
 
     #生成总内存分布柱状图
-    python3 summarydraw.py
+    python3 ./summarydraw.py
     #生成内存增长折线图
-    python3 statisticsdraw.py
+    python3 ./statisticsdraw.py
     #生成调用栈火焰图
+    ./flamegraph.pl --color=mem --title="malloc() bytes Flame Graph" --countname=bytes < out.stacks > stacks.svg
     
 ```
 
