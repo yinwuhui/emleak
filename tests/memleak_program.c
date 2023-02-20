@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 
+#define MAX_THREAD_NUM 4
+
 enum alloc_type{
     MALLOC_TYPE = 0,
     CALLOC_TYPE,
@@ -24,7 +26,18 @@ enum alloc_type{
     ALLOC_API_MAX
 };
 
-#define MAX_THREAD_NUM 4
+int64_t g_memleak_num[ALLOC_API_MAX] = {0};
+int64_t g_memleak_max[ALLOC_API_MAX] = {
+    102400,
+    202400,
+    302400,
+    402400,
+    502400,
+    602400,
+    702400,
+    802400,
+    902400,
+};
 
 void *malloc_node_get(int num)
 {
@@ -71,7 +84,7 @@ void *mmap_node_get(int num)
 
 void *posix_memalign_node_get(int num)
 {
-    void* ptr;
+    void* ptr = NULL;
     int alignment = 16;
 
     int result = posix_memalign(&ptr, alignment, num);
@@ -161,31 +174,41 @@ void *memery_get_expand(enum alloc_type type, int num)
 volatile int g_memery_index = 0;
 
 void *thread_function(void *arg) {
+    int malloc_num = 0;
     int index = *(int*)arg;
     char *q = NULL; 
     enum alloc_type type = MALLOC_TYPE;
+    srand(time(NULL)); 
 
     while(1){
         type = g_memery_index % ALLOC_API_MAX;
-        
-        printf("memery_get_expand %d %d\n", type, 100);
-        q = memery_get_expand(type, 100);
+        malloc_num = 1024*(ALLOC_API_MAX - type);
 
-        if(q != NULL){
-           //memset(q, 0xf, 10);
+        printf("+++ g_memleak_num[%d] = %ld, g_memleak_max[%d] = %ld\n", 
+                        type, g_memleak_num[type], type, g_memleak_max[type]);
+        if(g_memleak_num[type] >= g_memleak_max[type]){
+            usleep(500000);
+            continue;
+        }
+        
+        q = memery_get_expand(type, malloc_num);
+        if(q == NULL){
+            malloc_num = 0;
         }
         
         sleep(1);
 
+        g_memleak_num[type] += malloc_num;
         g_memery_index++;
     }
 
     pthread_exit(NULL);
 }
 
-/*共6个调用栈申请内存*/
 int main()
 {
+    printf("pid =%d...\n", getpid());
+
     pthread_t thread[MAX_THREAD_NUM];
     int tpara[MAX_THREAD_NUM] = {0};
     
