@@ -2,9 +2,9 @@
 
 [English](./README.md) | 中文介绍
 
-[![GitHub stars](https://img.shields.io/github/stars/yinwuhui/memleak-visual.svg?label=Stars&logo=github)](https://github.com/yinwuhui/memleak-visual)
-[![GitHub forks](https://img.shields.io/github/forks/yinwuhui/memleak-visual)](https://github.com/yinwuhui/memleak-visual)
-[![Github Version](https://img.shields.io/github/v/release/yinwuhui/memleak-visual?display_name=tag\&include_prereleases\&sort=semver)](https://github.com/yinwuhui/memleak-visual)
+[![GitHub stars](https://img.shields.io/github/stars/yinwuhui/emleak.svg?label=Stars&logo=github)](https://github.com/yinwuhui/emleak)
+[![GitHub forks](https://img.shields.io/github/forks/yinwuhui/emleak)](https://github.com/yinwuhui/emleak)
+[![Github Version](https://img.shields.io/github/v/release/yinwuhui/emleak?display_name=tag\&include_prereleases\&sort=semver)](https://github.com/yinwuhui/emleak)
 
 ### emleak(): 动态的跟踪进程的内存泄漏情况，对内存读写性能几乎无影响
 
@@ -104,15 +104,15 @@ OPTS:
 
 调用栈火焰图：
 
-[![Example](https://github.com/yinwuhui/memleak-visual/blob/main/images/stacksoutput.svg)](https://github.com/yinwuhui/memleak-visual/blob/main/images/stacksoutput.svg)
+[![Example](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/stacksoutput.svg)
 
 总内存分布柱状图：
 
-[![Example](https://github.com/yinwuhui/memleak-visual/blob/main/images/summaryoutput.svg)](https://github.com/yinwuhui/memleak-visual/blob/main/images/summaryoutput.svg)
+[![Example](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/summaryoutput.svg)
 
 内存变化趋势折线图：
 
-[![Example](https://github.com/yinwuhui/memleak-visual/blob/main/images/mleakstaticsoutput.svg)](https://github.com/yinwuhui/memleak-visual/blob/main/images/mleakstaticsoutput.svg)
+[![Example](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)](https://github.com/yinwuhui/emleak/blob/main/images/mleakstaticsoutput.svg)
 
 ## 自行编译
 
