@@ -22,6 +22,7 @@ enum alloc_type{
     VALLOC,
     MEMALIGN,
     PVALLOC,
+    CUSTOM,
 
     ALLOC_API_MAX
 };
@@ -36,6 +37,7 @@ int64_t g_memleak_max[ALLOC_API_MAX] = {
     602400,
     702400,
     802400,
+    902400,
     902400,
 };
 
@@ -131,6 +133,16 @@ void *pvalloc_node_get(int num)
 };
 #endif
 
+void *myself_malloc(size_t size)
+{
+    return malloc(size);
+}
+
+void myself_free(void *addr)
+{
+    free(addr);
+}
+
 void *memery_get_expand(enum alloc_type type, int num)
 {
     switch(type){
@@ -163,6 +175,9 @@ void *memery_get_expand(enum alloc_type type, int num)
             return pvalloc_node_get(num);
         }
         #endif
+        case CUSTOM:{
+            return myself_malloc(num);
+        }
         default:{
             return NULL;
         }
