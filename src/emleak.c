@@ -659,7 +659,7 @@ ssize_t get_symbol_uprobe_offset(char *elf_pwd, char *symbol_name)
 	}
 
 	/*open the elf file.*/
-	handle = dlopen(elf_pwd, RTLD_LAZY); 
+	handle = dlopen(elf_pwd, RTLD_NOW); 
     if (!handle) {
         fprintf(stderr, "Error: %s\n", dlerror());
         return 0;
