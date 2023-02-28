@@ -403,3 +403,26 @@ int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 
     return 0;
 }
+
+SEC("uprobe")
+int BPF_KPROBE(malloc_add)
+{
+	int ret = 0;
+    size_t size = PT_REGS_PARM1(ctx);
+
+    ret = gen_alloc_enter(size);
+    return ret;
+}
+
+SEC("uretprobe")
+int BPF_KRETPROBE(retmalloc_add)
+{
+	return gen_alloc_exit(ctx);
+}
+
+SEC("uprobe")
+int BPF_KRETPROBE(free_add)
+{
+	void *address = (void *)PT_REGS_RET(ctx);
+    return gen_free_enter(ctx, address);
+}

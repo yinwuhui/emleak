@@ -13,6 +13,8 @@
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <dlfcn.h>
 
 #include "uthash.h"
 #include "common.h"
@@ -57,13 +59,17 @@ static const char *__doc__ =
 "\nOPTS:\n"
 "    -p    the PID to trace \n"
 "    -c    the program name to trace, must start emleak before program \n"
-"    -i    interval in seconds to print outstanding allocations \n";
+"    -i    interval in seconds to print outstanding allocations \n"
+"    -m    set you customized malloc function. ex(-m my_malloc) \n"
+"    -f    set you customized free function. ex(-m my_free) \n";
 
 static const struct option long_options[] = {
 	{ "help", no_argument, NULL, 'h' },
 	{ "pid", required_argument, NULL, 'p' },
 	{ "comm", required_argument, NULL, 'c' },
 	{ "interval", required_argument, NULL, 'i' },
+	{ "malloc", required_argument, NULL, 'p' },
+	{ "free", required_argument, NULL, 'c' },
 	{}
 };
 
@@ -93,7 +99,7 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 	int longindex = 0;
 	
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "p:c:i:h",
+	while ((opt = getopt_long(argc, argv, "p:c:i:m:f:h",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'p':
@@ -108,6 +114,20 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			break;
 		case 'i':
 			paras->interval = strtoul(optarg, NULL, 0);
+			break;
+		case 'm':
+			if(strlen(optarg) > MAXFILELEN){
+				error = true;
+				goto err_out;
+			}
+			strcpy(paras->mfuncname, optarg);
+			break;
+		case 'f':
+			if(strlen(optarg) > MAXFILELEN){
+				error = true;
+				goto err_out;
+			}
+			strcpy(paras->ffuncname, optarg);
 			break;
 		case 'h':
 			error = false;
@@ -427,9 +447,33 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
+int get_executable_path_by_pid(int pid, char *path_buf, size_t buf_size)
+{
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+
+    char exe_link[MAXFILELEN];
+    memset(exe_link, 0, sizeof(exe_link));
+    snprintf(exe_link, sizeof(exe_link), "/proc/%s/exe", pid_str);
+
+    ssize_t len = readlink(exe_link, path_buf, buf_size);
+    if (len == -1) {
+        perror("readlink");
+        return -1;
+    }
+
+    path_buf[len] = '\0';
+    return 0;
+}
+
 static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 {
-	/*If it is a name, wait until the process is checked before initializing*/
+	/*load program pwd*/
+	if(paras->pid != 0){
+		get_executable_path_by_pid(paras->pid, paras->elffile, MAXFILELEN);
+	}
+
+	/*If is not pid, wait until the process is checked before initializing*/
 	if(paras->pid != 0){
 		int ret = proc_syms_load(paras->pid);
 		if(ret == 0){
@@ -602,6 +646,83 @@ void emleak_signal(int sig)
 	return ;
 }
 
+ssize_t get_symbol_uprobe_offset(char *elf_pwd, char *symbol_name)
+{
+	void *handle = NULL;
+    void *func_ptr = NULL;
+	Dl_info info;
+
+	memset(&info, 0x00, sizeof(info));
+
+	if(elf_pwd == NULL || symbol_name == NULL){
+		return 0;
+	}
+
+	/*open the elf file.*/
+	handle = dlopen(elf_pwd, RTLD_LAZY); 
+    if (!handle) {
+        fprintf(stderr, "Error: %s\n", dlerror());
+        return 0;
+    }
+
+	func_ptr = dlsym(handle, symbol_name);
+    if (!func_ptr) {
+        fprintf(stderr, "Error: %s\n", dlerror());
+        return 0;
+    }
+
+	if (!dladdr(func_ptr, &info)) {
+        fprintf(stderr, "Error: %s\n", dlerror());
+        return 0;
+    }
+
+	dlclose(handle);
+
+    return func_ptr - info.dli_fbase;
+}
+
+int user_defined_func_attach(struct emleak_bpf *skel,
+				char *elf_pwd, char *malloc_func, char *free_func)
+{
+	long m_offset, f_offset;
+
+	if(!skel){
+		return -1;
+	}
+
+	m_offset = get_symbol_uprobe_offset(elf_pwd, malloc_func);
+	f_offset = get_symbol_uprobe_offset(elf_pwd, free_func);
+
+	/*touch malloc*/
+	if(m_offset != 0){
+		skel->links.malloc_add = bpf_program__attach_uprobe(skel->progs.malloc_add,
+							    		false, 0, elf_pwd, m_offset);
+		if (!skel->links.malloc_add) {
+			//fprintf(stderr, "Failed to attach uprobe malloc: %d\n", err);
+			return -1;
+		}
+
+		skel->links.retmalloc_add = bpf_program__attach_uprobe(skel->progs.retmalloc_add,
+									true, 0, elf_pwd, m_offset);
+		if (!skel->links.retmalloc_add) {
+			//fprintf(stderr, "Failed to attach upretrobe malloc: %d\n", err);
+			return -1;
+		}
+	}
+
+	/*touch free*/
+	if(f_offset != 0){
+		skel->links.free_add = bpf_program__attach_uprobe(skel->progs.free_add,
+							    		false, 0, elf_pwd, f_offset);
+		if (!skel->links.free_add) {
+			//fprintf(stderr, "Failed to attach uprobe free: %d\n", err);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int err;
@@ -631,6 +752,13 @@ int main(int argc, char **argv)
 	bpf_para_load(skel, &cmdparas);
 
 	/* Load & verify BPF programs */
+	err = user_defined_func_attach(skel, 
+						cmdparas.elffile, cmdparas.mfuncname, cmdparas.ffuncname);
+	if (err) {
+		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		goto cleanup;
+	}
+
 	err = emleak_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load and verify BPF skeleton\n");

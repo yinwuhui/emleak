@@ -5,7 +5,7 @@
 #include "emleak.share.h"
 
 #define PRINT_RAW_ADDR 1
-#define MAXFILELEN 256
+#define MAXFILELEN 512
 
 #define STACK_OUTFILE_NAME "mleakstacks.txt"
 #define SUMMARY_OUTFILE_NAME "mleaksummary.csv"
@@ -17,7 +17,10 @@ struct emleakpara{
     int interval;                          /**< 统计周期/单位s*/
     char stackfile[MAXFILELEN];            /**< 调动栈文件*/     
     char summaryfile[MAXFILELEN];          /**< 摘要信息文件*/   
-    char statisticalfile[MAXFILELEN];      /**< 详细统计文件*/     
+    char statisticalfile[MAXFILELEN];      /**< 详细统计文件*/
+    char elffile[MAXFILELEN];              /**< 可执行文件的路径或者库的路径*/
+    char mfuncname[MAXFILELEN];            /**< 申请内存的API的名字*/
+    char ffuncname[MAXFILELEN];            /**< 释放内存的API名字*/
 };
 
 struct stack_node {
