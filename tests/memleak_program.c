@@ -38,7 +38,7 @@ int64_t g_memleak_max[ALLOC_API_MAX] = {
     702400,
     802400,
     902400,
-    902400,
+    1002400,
 };
 
 void *malloc_node_get(int num)
