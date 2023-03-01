@@ -1,0 +1,33 @@
+7168 bytes allocated at callstack id 15999: 
+	myself_malloc+0x1c;
+	memery_get_expand+0xa1;
+	thread_function+0x115;
+	start_thread+0x2f3;
+20480 bytes allocated at callstack id 16288: 
+	valloc_node_get+0x1c;
+	memery_get_expand+0x92;
+	thread_function+0x115;
+	start_thread+0x2f3;
+32768 bytes allocated at callstack id 706: 
+	realloc_node_get+0x1c;
+	memery_get_expand+0x62;
+	thread_function+0x115;
+	start_thread+0x2f3;
+46080 bytes allocated at callstack id 12275: 
+	calloc_node_get+0x21;
+	memery_get_expand+0x56;
+	thread_function+0x115;
+	start_thread+0x2f3;
+49152 bytes allocated at callstack id 12530: 
+	posix_memalign+0x1a8;
+	[UNKNOWN]+0x0;
+50176 bytes allocated at callstack id 10209: 
+	mmap_node_get+0x94;
+	memery_get_expand+0x6e;
+	thread_function+0x115;
+	start_thread+0x2f3;
+81920 bytes allocated at callstack id 12353: 
+	aligned_alloc_node_get+0x2c;
+	memery_get_expand+0x86;
+	thread_function+0x115;
+	start_thread+0x2f3;
