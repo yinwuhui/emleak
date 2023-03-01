@@ -13,6 +13,19 @@ lines.insert(0, last_line)  # 插入到第一行
 with open('tmp_mleakstatics.csv', 'w') as f:
     f.writelines(lines)
 
+# 获取第一列的值
+import csv
+
+# 创建一个空列表来存储第一列的值
+timestamps = []
+with open('tmp_mleakstatics.csv', newline='') as csvfile:
+    # 创建 CSV 文件读取器
+    reader = csv.reader(csvfile)
+    # 跳过第一行
+    next(reader)
+    # 遍历每一行并将第一列（除第一个元素之外的所有元素）添加到列表中
+    for row in reader:
+        timestamps.append(row[0])
 
 # 读取csv文件并将数据存入列表
 with open('tmp_mleakstatics.csv') as f:
@@ -25,7 +38,7 @@ with open('tmp_mleakstatics.csv') as f:
 
 # 将第一列的时间戳转换成datetime类型的值
 x_labels = []
-for timestamp in map(int, data[0]):
+for timestamp in map(int, timestamps):
     dt = datetime.datetime.fromtimestamp(timestamp)
     x_labels.append(dt.strftime('%Y-%m-%d %H:%M:%S'))
 
