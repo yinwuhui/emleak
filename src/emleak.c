@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdlib.h>
+
+#define __USE_GNU
 #include <dlfcn.h>
 
 #include "uthash.h"
