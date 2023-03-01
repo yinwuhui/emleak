@@ -13,9 +13,6 @@ lines.insert(0, last_line)  # 插入到第一行
 with open('tmp_mleakstatics.csv', 'w') as f:
     f.writelines(lines)
 
-# 获取第一列的值
-import csv
-
 # 创建一个空列表来存储第一列的值
 timestamps = []
 with open('tmp_mleakstatics.csv', newline='') as csvfile:
