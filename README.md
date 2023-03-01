@@ -165,7 +165,7 @@ OPTS:
 ```
     ##预处理：
         由于libbpf-bootstrap项目中一个bug，如果您拉取的时候已修复，这步可以忽略。
-        需要修改文件：libbpf-bootstrap\vmlinux\x86\vmlinux.h 第一行：
+        需要修改文件：vim libbpf-bootstrap/vmlinux/x86/vmlinux.h 第一行：
         源数据：vmlinux_601.h
         改为：#include "vmlinux_601.h"
 
