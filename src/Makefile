@@ -20,19 +20,17 @@ CFLAGS := -g -Wall -pthread
 ALL_LDFLAGS := $(LDFLAGS) $(EXTRA_LDFLAGS)
 ALL_SLIB := -L$(OUTPUT) -lbpf -L./bcclib/ -lbcc -lelf -lz
 
+# The bundled libbpf is built with -Werror on some toolchains.  Keep the
+# existing source buildable with the GCC versions commonly used by emleak.
+EXTRA_CFLAGS ?= -Wno-error=discarded-qualifiers
+export EXTRA_CFLAGS
+
 APPS = emleak
 COBJS = 
 CXXOBJS = procsyms
 
 CARGO ?= $(shell which cargo)
-ifeq ($(strip $(CARGO)),)
 BZS_APPS :=
-else
-BZS_APPS := profile
-APPS += $(BZS_APPS)
-# Required by libblazesym
-ALL_LDFLAGS += -lrt -ldl -lpthread -lm
-endif
 
 # Get Clang's default includes on this system. We'll explicitly add these dirs
 # to the includes list when compiling with `-target bpf` because otherwise some
