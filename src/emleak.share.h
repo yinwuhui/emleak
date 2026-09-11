@@ -5,14 +5,16 @@
 
 #define TASK_COMM_LEN 16
 
-#define MAX_CALL_STACKS 10240
+#define MAX_CALL_STACKS 65536
 
 #define PERF_BUFFER_PAGES       16
 #define PERF_POLL_TIMEOUT_MS    100
 
 #define SHOULD_PRINT 1
 #define SAMPLE_EVERY_N 5
-#define STACK_FLAGS (0 | BPF_F_USER_STACK)
+#define USER_STACK_FLAGS (0 | BPF_F_USER_STACK)
+#define KERNEL_STACK_FLAGS 0
+#define PAGE_SIZE_BYTES 4096
 
 typedef __s8  s8;
 typedef __u8  u8;
@@ -45,6 +47,7 @@ struct combined_alloc_info_t {
 struct prog_infor_t {
         u64 prog_pid;                          /**< 进程pid*/
         volatile enum progstate_e prog_state;  /**< 进程状态*/
+        u64 trace_kernel;                      /**< 是否跟踪内核内存*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/

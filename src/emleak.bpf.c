@@ -49,16 +49,23 @@ struct {
 	__uint(value_size, sizeof(__u32));
 } events SEC(".maps");
 
-static inline int prog_is_enable()
+static inline int user_prog_is_enable()
 {
     __be64 group_pid = bpf_get_current_pid_tgid() >> 32;
 
-    if(g_emleak_prog.prog_state != PROG_START_STATE 
+    if(g_emleak_prog.trace_kernel
+            || g_emleak_prog.prog_state != PROG_START_STATE
             || group_pid != g_emleak_prog.prog_pid){
         return 0;
     }
 
     return 1;
+}
+
+static inline int kernel_prog_is_enable()
+{
+    return g_emleak_prog.trace_kernel
+            && g_emleak_prog.prog_state == PROG_START_STATE;
 }
 
 static inline void update_statistics_add(u64 stack_id, u64 sz) {
@@ -99,7 +106,7 @@ static inline void update_statistics_del(u64 stack_id, u64 sz) {
 }
 
 static inline int gen_alloc_enter(size_t size) {
-    if(!prog_is_enable()){
+    if(!user_prog_is_enable()){
         return 0;
     }
 
@@ -138,7 +145,8 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
 
     if (address != 0) {
         info.timestamp_ns = bpf_ktime_get_ns();
-        info.stack_id = bpf_get_stackid(ctx, &stack_traces, STACK_FLAGS);
+        info.stack_id = bpf_get_stackid(ctx, &stack_traces,
+                    g_emleak_prog.trace_kernel ? KERNEL_STACK_FLAGS : USER_STACK_FLAGS);
         bpf_map_update_elem(&allocs, &address, &info, BPF_ANY);
         update_statistics_add(info.stack_id, info.size);
     }
@@ -152,7 +160,7 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
 }
 
 static inline int gen_alloc_exit(struct pt_regs *ctx) {
-    if(!prog_is_enable()){
+    if(!user_prog_is_enable()){
         return 0;
     }
 
@@ -160,7 +168,7 @@ static inline int gen_alloc_exit(struct pt_regs *ctx) {
 }
 
 static inline int gen_free_enter(struct pt_regs *ctx, void *address) {
-    if(!prog_is_enable()){
+    if(!user_prog_is_enable()){
         return 0;
     }
 
@@ -179,6 +187,47 @@ static inline int gen_free_enter(struct pt_regs *ctx, void *address) {
         bpf_trace_printk(free_fmt, sizeof(free_fmt), addr, info->size);
     }
     
+    return 0;
+}
+
+static inline int gen_kernel_alloc_enter(size_t size)
+{
+    if (!kernel_prog_is_enable()) {
+        return 0;
+    }
+
+    __be64 pid = bpf_get_current_pid_tgid();
+    __be64 size64 = size;
+
+    bpf_map_update_elem(&sizes, &pid, &size64, BPF_ANY);
+    return 0;
+}
+
+static inline int gen_kernel_alloc_exit2(void *ctx, u64 address)
+{
+    if (!kernel_prog_is_enable()) {
+        return 0;
+    }
+
+    return gen_alloc_exit2((struct pt_regs *)ctx, address);
+}
+
+static inline int gen_kernel_free_enter(void *ctx, void *address)
+{
+    u64 addr = (u64)address;
+    struct alloc_info_t *info;
+
+    if (!kernel_prog_is_enable()) {
+        return 0;
+    }
+
+    info = bpf_map_lookup_elem(&allocs, &addr);
+    if (info == 0){
+        return 0;
+    }
+
+    bpf_map_delete_elem(&allocs, &addr);
+    update_statistics_del(info->stack_id, info->size);
     return 0;
 }
 
@@ -201,7 +250,7 @@ int malloc_exit(struct pt_regs *ctx)
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:free")
 int free_enter(struct pt_regs *ctx) {
-    void *address = (void *)PT_REGS_RET(ctx);
+    void *address = (void *)PT_REGS_PARM1(ctx);
     return gen_free_enter(ctx, address);
 }
 
@@ -248,7 +297,7 @@ int mmap_exit(struct pt_regs *ctx) {
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:munmap")
 int munmap_enter(struct pt_regs *ctx) {
-    void *address = (void *)PT_REGS_RET(ctx);
+    void *address = (void *)PT_REGS_PARM1(ctx);
 
     return gen_free_enter(ctx, address);
 }
@@ -383,7 +432,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 SEC("tp/sched/sched_process_exit")
 int handle_exit(struct trace_event_raw_sched_process_template* ctx)
 {
-    if(!prog_is_enable()){
+    if(!user_prog_is_enable()){
         return 0;
     }
 
@@ -423,6 +472,76 @@ int BPF_KRETPROBE(retmalloc_add)
 SEC("uprobe")
 int BPF_KRETPROBE(free_add)
 {
-	void *address = (void *)PT_REGS_RET(ctx);
+	void *address = (void *)PT_REGS_PARM1(ctx);
     return gen_free_enter(ctx, address);
+}
+
+SEC("tp/kmem/kmalloc")
+int handle_kmalloc(struct trace_event_raw_kmalloc *ctx)
+{
+    size_t size = ctx->bytes_alloc;
+    u64 ptr = (u64)ctx->ptr;
+
+    gen_kernel_alloc_enter(size);
+    return gen_kernel_alloc_exit2(ctx, ptr);
+}
+
+SEC("tp/kmem/kmalloc_node")
+int handle_kmalloc_node(struct trace_event_raw_kmalloc *ctx)
+{
+    size_t size = ctx->bytes_alloc;
+    u64 ptr = (u64)ctx->ptr;
+
+    gen_kernel_alloc_enter(size);
+    return gen_kernel_alloc_exit2(ctx, ptr);
+}
+
+SEC("tp/kmem/kmem_cache_alloc")
+int handle_kmem_cache_alloc(struct trace_event_raw_kmem_cache_alloc *ctx)
+{
+    size_t size = ctx->bytes_alloc;
+    u64 ptr = (u64)ctx->ptr;
+
+    gen_kernel_alloc_enter(size);
+    return gen_kernel_alloc_exit2(ctx, ptr);
+}
+
+SEC("tp/kmem/kmem_cache_alloc_node")
+int handle_kmem_cache_alloc_node(struct trace_event_raw_kmem_cache_alloc *ctx)
+{
+    size_t size = ctx->bytes_alloc;
+    u64 ptr = (u64)ctx->ptr;
+
+    gen_kernel_alloc_enter(size);
+    return gen_kernel_alloc_exit2(ctx, ptr);
+}
+
+SEC("tp/kmem/kfree")
+int handle_kfree(struct trace_event_raw_kfree *ctx)
+{
+    return gen_kernel_free_enter(ctx, (void *)ctx->ptr);
+}
+
+SEC("tp/kmem/kmem_cache_free")
+int handle_kmem_cache_free(struct trace_event_raw_kmem_cache_free *ctx)
+{
+    return gen_kernel_free_enter(ctx, (void *)ctx->ptr);
+}
+
+SEC("tp/kmem/mm_page_alloc")
+int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
+{
+    u64 addr = ctx->pfn << 12;
+    u64 size = PAGE_SIZE_BYTES << ctx->order;
+
+    gen_kernel_alloc_enter(size);
+    return gen_kernel_alloc_exit2(ctx, addr);
+}
+
+SEC("tp/kmem/mm_page_free")
+int handle_mm_page_free(struct trace_event_raw_mm_page_free *ctx)
+{
+    u64 addr = ctx->pfn << 12;
+
+    return gen_kernel_free_enter(ctx, (void *)addr);
 }

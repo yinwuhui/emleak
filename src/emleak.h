@@ -21,6 +21,8 @@ struct emleakpara{
     char elffile[MAXFILELEN];              /**< 可执行文件的路径或者库的路径*/
     char mfuncname[MAXFILELEN];            /**< 申请内存的API的名字*/
     char ffuncname[MAXFILELEN];            /**< 释放内存的API名字*/
+    int trace_kernel;                      /**< 跟踪内核内存*/
+    int trace_kernel_pages;                /**< 跟踪内核页分配*/
 };
 
 struct stack_node {
@@ -31,7 +33,7 @@ struct stack_node {
 };
 
 struct ksym {
-	long addr;
+	unsigned long addr;
 	char *name;
 };
 

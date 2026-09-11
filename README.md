@@ -56,6 +56,8 @@ OPTS:
     -p    the PID to trace
     -c    the program name to trace, must start memleak before program
     -i    interval in seconds to print outstanding allocations
+    -k    trace kernel memory allocations globally
+    --kernel-pages    additionally trace page allocator events
 
 ./emleak -p 12356
 #指定进程pid跟踪，默认10s记录一次内存信息到文件.
@@ -67,6 +69,13 @@ OPTS:
 
 ./emleak -p 12356 -i 1
 #设置自定义的记录周期
+
+sudo ./emleak -k -i 5
+#跟踪内核 kmalloc/slab 分配和释放，使用内核调用栈定位未释放对象。
+#内核模式是全局跟踪，可能包含跟踪器自身及系统服务产生的分配。
+
+sudo ./emleak -k --kernel-pages -i 5
+#额外跟踪页分配器事件；事件量较大，适合短时间定位物理页级问题。
 
 ```
 
@@ -189,7 +198,7 @@ OPTS:
 ## 后续开发计划
 ```
     1、支持跟踪用户自定义的内存申请/释放接口
-    2、实现内核内存泄漏监测
+    2、完善内核内存泄漏监测（当前已支持 kmalloc/slab 分配，页分配为实验性选项）
     3、支持启用物理内存泄漏检测
     4、适配主流Linux发行版本
 ```

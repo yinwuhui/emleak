@@ -62,6 +62,8 @@ static const char *__doc__ =
 "    -p    the PID to trace \n"
 "    -c    the program name to trace, must start emleak before program \n"
 "    -i    interval in seconds to print outstanding allocations \n"
+"    -k    trace kernel allocations \n"
+"    --kernel-pages trace kernel page allocator too \n"
 "    -m    set you customized malloc function. ex(-m my_malloc) \n"
 "    -f    set you customized free function. ex(-m my_free) \n";
 
@@ -70,10 +72,178 @@ static const struct option long_options[] = {
 	{ "pid", required_argument, NULL, 'p' },
 	{ "comm", required_argument, NULL, 'c' },
 	{ "interval", required_argument, NULL, 'i' },
-	{ "malloc", required_argument, NULL, 'p' },
-	{ "free", required_argument, NULL, 'c' },
+	{ "kernel", no_argument, NULL, 'k' },
+	{ "kernel-pages", no_argument, NULL, 1000 },
+	{ "malloc", required_argument, NULL, 'm' },
+	{ "free", required_argument, NULL, 'f' },
 	{}
 };
+
+static struct ksym *g_ksyms;
+static int g_ksyms_num;
+
+static int ksym_cmp(const void *a, const void *b)
+{
+	const struct ksym *ka = a;
+	const struct ksym *kb = b;
+
+	if (ka->addr < kb->addr)
+		return -1;
+	if (ka->addr > kb->addr)
+		return 1;
+	return 0;
+}
+
+static int kernel_syms_load(void)
+{
+	FILE *fp;
+	char line[512];
+	int capacity = 0;
+
+	fp = fopen("/proc/kallsyms", "r");
+	if (!fp) {
+		perror("fopen /proc/kallsyms");
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long addr;
+		char type;
+		char name[SYMBOL_NAME_LEN];
+
+		if (sscanf(line, "%lx %c %127s", &addr, &type, name) != 3)
+			continue;
+		if (addr == 0)
+			continue;
+
+		if (g_ksyms_num == capacity) {
+			struct ksym *new_syms;
+
+			capacity = capacity ? capacity * 2 : 4096;
+			new_syms = realloc(g_ksyms, capacity * sizeof(*g_ksyms));
+			if (!new_syms) {
+				fclose(fp);
+				return -1;
+			}
+			g_ksyms = new_syms;
+		}
+
+		g_ksyms[g_ksyms_num].addr = addr;
+		g_ksyms[g_ksyms_num].name = strdup(name);
+		if (!g_ksyms[g_ksyms_num].name) {
+			fclose(fp);
+			return -1;
+		}
+		g_ksyms_num++;
+	}
+
+	fclose(fp);
+	qsort(g_ksyms, g_ksyms_num, sizeof(*g_ksyms), ksym_cmp);
+	printf("Loaded kernel symbols, num = %d.\n", g_ksyms_num);
+	return g_ksyms_num > 0 ? 0 : -1;
+}
+
+static int kernel_symbol_resolve(uint64_t addr, struct proc_symbol *symbol)
+{
+	int left = 0;
+	int right = g_ksyms_num - 1;
+	int best = -1;
+
+	if (!symbol || !symbol->name || g_ksyms_num <= 0)
+		return -1;
+
+	while (left <= right) {
+		int mid = left + (right - left) / 2;
+
+		if (g_ksyms[mid].addr <= addr) {
+			best = mid;
+			left = mid + 1;
+		} else {
+			right = mid - 1;
+		}
+	}
+
+	if (best < 0) {
+		strcpy(symbol->name, "[UNKNOWN]");
+		symbol->offset = 0;
+		return -1;
+	}
+
+	snprintf(symbol->name, SYMBOL_NAME_LEN, "%s", g_ksyms[best].name);
+	symbol->offset = addr - g_ksyms[best].addr;
+	return 0;
+}
+
+static int tracepoint_exists(const char *category, const char *name)
+{
+	char path[MAXFILELEN];
+
+	snprintf(path, sizeof(path), "/sys/kernel/debug/tracing/events/%s/%s/id",
+		 category, name);
+	return access(path, R_OK) == 0;
+}
+
+static void set_user_programs_autoload(struct emleak_bpf *skel, bool autoload)
+{
+	bpf_program__set_autoload(skel->progs.malloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.malloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.free_enter, autoload);
+	bpf_program__set_autoload(skel->progs.calloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.calloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.realloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.realloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.mmap_enter, autoload);
+	bpf_program__set_autoload(skel->progs.mmap_exit, autoload);
+	bpf_program__set_autoload(skel->progs.munmap_enter, autoload);
+	bpf_program__set_autoload(skel->progs.posix_memalign_enter, autoload);
+	bpf_program__set_autoload(skel->progs.posix_memalign_exit, autoload);
+	bpf_program__set_autoload(skel->progs.aligned_alloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.aligned_alloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.valloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.valloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.memalign_enter, autoload);
+	bpf_program__set_autoload(skel->progs.memalign_exit, autoload);
+	bpf_program__set_autoload(skel->progs.pvalloc_enter, autoload);
+	bpf_program__set_autoload(skel->progs.pvalloc_exit, autoload);
+	bpf_program__set_autoload(skel->progs.malloc_add, autoload);
+	bpf_program__set_autoload(skel->progs.retmalloc_add, autoload);
+	bpf_program__set_autoload(skel->progs.free_add, autoload);
+}
+
+static void set_kernel_programs_autoload(struct emleak_bpf *skel, bool autoload, bool trace_pages)
+{
+	bpf_program__set_autoload(skel->progs.handle_kmalloc,
+				  autoload && tracepoint_exists("kmem", "kmalloc"));
+	bpf_program__set_autoload(skel->progs.handle_kmalloc_node,
+				  autoload && tracepoint_exists("kmem", "kmalloc_node"));
+	bpf_program__set_autoload(skel->progs.handle_kmem_cache_alloc,
+				  autoload && tracepoint_exists("kmem", "kmem_cache_alloc"));
+	bpf_program__set_autoload(skel->progs.handle_kmem_cache_alloc_node,
+				  autoload && tracepoint_exists("kmem", "kmem_cache_alloc_node"));
+	bpf_program__set_autoload(skel->progs.handle_kfree,
+				  autoload && tracepoint_exists("kmem", "kfree"));
+	bpf_program__set_autoload(skel->progs.handle_kmem_cache_free,
+				  autoload && tracepoint_exists("kmem", "kmem_cache_free"));
+	bpf_program__set_autoload(skel->progs.handle_mm_page_alloc,
+				  autoload && trace_pages && tracepoint_exists("kmem", "mm_page_alloc"));
+	bpf_program__set_autoload(skel->progs.handle_mm_page_free,
+				  autoload && trace_pages && tracepoint_exists("kmem", "mm_page_free"));
+}
+
+static void configure_bpf_programs(struct emleak_bpf *skel, struct emleakpara *paras)
+{
+	if (paras->trace_kernel) {
+		set_user_programs_autoload(skel, false);
+		bpf_program__set_autoload(skel->progs.handle_exec, false);
+		bpf_program__set_autoload(skel->progs.handle_exit, false);
+		set_kernel_programs_autoload(skel, true, paras->trace_kernel_pages);
+	} else {
+		set_user_programs_autoload(skel, true);
+		bpf_program__set_autoload(skel->progs.handle_exec, true);
+		bpf_program__set_autoload(skel->progs.handle_exit, true);
+		set_kernel_programs_autoload(skel, false, false);
+	}
+}
 
 void emleak_usage(char *argv[], const struct option *long_options,
 		  		const char *doc, bool error)
@@ -86,8 +256,10 @@ void emleak_usage(char *argv[], const struct option *long_options,
 		if (long_options[i].flag != NULL)
 			printf(" flag (internal value: %d)",
 			       *long_options[i].flag);
-		else
+		else if (long_options[i].val >= 32 && long_options[i].val <= 126)
 			printf("\t short-option: -%c", long_options[i].val);
+		else
+			printf("\t long-only option");
 		printf("\n");
 	}
 	printf("\n");
@@ -101,7 +273,7 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 	int longindex = 0;
 	
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "p:c:i:m:f:h",
+	while ((opt = getopt_long(argc, argv, "p:c:i:m:f:kh",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'p':
@@ -116,6 +288,13 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			break;
 		case 'i':
 			paras->interval = strtoul(optarg, NULL, 0);
+			break;
+		case 'k':
+			paras->trace_kernel = 1;
+			break;
+		case 1000:
+			paras->trace_kernel = 1;
+			paras->trace_kernel_pages = 1;
 			break;
 		case 'm':
 			if(strlen(optarg) > MAXFILELEN){
@@ -205,7 +384,11 @@ static void print_stacks(struct stack_node **stackmaps, char *outfilename)
 				continue;
 			}
 
-			ret = proc_symbol_resolve(progstack[i], &symbol);	
+			if (cmdparas.trace_kernel) {
+				ret = kernel_symbol_resolve(progstack[i], &symbol);
+			} else {
+				ret = proc_symbol_resolve(progstack[i], &symbol);
+			}
 			if(ret != 0){
 				break;
 			}
@@ -355,6 +538,11 @@ static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 	g_statistical.stack_summry[0] = time(NULL);
 	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next)
 	{
+		if(tmpnode->stack_id < 0 || tmpnode->stack_id >= MAX_CALL_STACKS
+				|| g_statistical.stack_num >= MAX_CALL_STACKS){
+			continue;
+		}
+
 		if(g_statistical.stack_hash[tmpnode->stack_id] == 0){
 			g_statistical.stack_hash[tmpnode->stack_id] = g_statistical.stack_num;
 			index_summry = g_statistical.stack_num;
@@ -423,6 +611,7 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 		bpf_map_lookup_elem(g_allocs_fd, &key, &alloc_info);
 
 		if(alloc_info.stack_id < 0){
+			prev_key = key;
 			continue;
 		}
 
@@ -433,8 +622,12 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	/*Sort by memory size*/
 	HASH_SORT(stackmaps, cmp_by_memsum);
 
-	print_stacks(&stackmaps, stacksfile);
-	print_summary(&stackmaps, summaryfile);
+	if (stacksfile && strlen(stacksfile)) {
+		print_stacks(&stackmaps, stacksfile);
+	}
+	if (summaryfile && strlen(summaryfile)) {
+		print_summary(&stackmaps, summaryfile);
+	}
 	print_statistical(&stackmaps, statisticalfile);
 	if(islastprint)
 	{
@@ -446,6 +639,9 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
+	if (level == LIBBPF_DEBUG)
+		return 0;
+
 	return vfprintf(stderr, format, args);
 }
 
@@ -470,6 +666,15 @@ int get_executable_path_by_pid(int pid, char *path_buf, size_t buf_size)
 
 static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 {
+	if (paras->trace_kernel) {
+		skel->bss->g_emleak_prog.trace_kernel = 1;
+		skel->bss->g_emleak_prog.prog_pid = 0;
+		skel->bss->g_emleak_prog.prog_state = PROG_START_STATE;
+		kernel_syms_load();
+		outfiles_init(0, paras);
+		goto set_start_time;
+	}
+
 	/*load program pwd*/
 	if(paras->pid != 0){
 		get_executable_path_by_pid(paras->pid, paras->elffile, MAXFILELEN);
@@ -495,6 +700,7 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 		skel->bss->g_emleak_prog.prog_state = PROG_IDEL_STATE;
 	}
 
+set_start_time:
 	struct timespec stime;
 	clock_gettime(CLOCK_MONOTONIC, &stime);
 	skel->bss->g_emleak_prog.start_time = stime.tv_sec;
@@ -612,18 +818,8 @@ void* print_thread(void* arg)
 		times_index++;
 
 		if(g_signal){
-			struct event_t new_msg;
-			new_msg.pid = skel->bss->g_emleak_prog.prog_pid;
-			new_msg.msg_type = 0;
-			new_msg.old_state = skel->bss->g_emleak_prog.prog_state;
-			new_msg.new_state = PROG_END_STATE;
-
-			handle_perf_event(NULL, 0 , &new_msg, sizeof(new_msg));
-
-			printf("Exporting call stack data successfully. outfile[%s,%s,%s]\n", 
-			            cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile);
 			close(event.data.fd);
-			exit(0);
+			return NULL;
 		}
 
 		if(times_index < interval){
@@ -657,6 +853,9 @@ ssize_t get_symbol_uprobe_offset(char *elf_pwd, char *symbol_name)
 	memset(&info, 0x00, sizeof(info));
 
 	if(elf_pwd == NULL || symbol_name == NULL){
+		return 0;
+	}
+	if(strlen(elf_pwd) == 0 || strlen(symbol_name) == 0){
 		return 0;
 	}
 
@@ -752,19 +951,22 @@ int main(int argc, char **argv)
 	}
 
 	bpf_para_load(skel, &cmdparas);
+	configure_bpf_programs(skel, &cmdparas);
 
 	/* Load & verify BPF programs */
-	err = user_defined_func_attach(skel, 
-						cmdparas.elffile, cmdparas.mfuncname, cmdparas.ffuncname);
+	err = emleak_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
 		goto cleanup;
 	}
 
-	err = emleak_bpf__load(skel);
-	if (err) {
-		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
-		goto cleanup;
+	if (!cmdparas.trace_kernel) {
+		err = user_defined_func_attach(skel,
+							cmdparas.elffile, cmdparas.mfuncname, cmdparas.ffuncname);
+		if (err) {
+			fprintf(stderr, "Failed to attach customized allocation functions\n");
+			goto cleanup;
+		}
 	}
 
 	g_sizes_fd = bpf_map__fd(skel->maps.sizes); 
@@ -809,6 +1011,19 @@ int main(int argc, char **argv)
 			printf("error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
+		if (g_signal) {
+			struct event_t new_msg;
+
+			new_msg.pid = skel->bss->g_emleak_prog.prog_pid;
+			new_msg.msg_type = 0;
+			new_msg.old_state = skel->bss->g_emleak_prog.prog_state;
+			new_msg.new_state = PROG_END_STATE;
+
+			handle_perf_event(NULL, 0 , &new_msg, sizeof(new_msg));
+			printf("Exporting call stack data successfully. outfile[%s,%s,%s]\n",
+			            cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile);
+			g_exiting = 1;
+		}
 		/* reset err to return 0 if exiting */
 		err = 0;
 	}
@@ -817,4 +1032,3 @@ cleanup:
 	emleak_bpf__destroy(skel);
 	return -err;
 }
-
