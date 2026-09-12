@@ -10,14 +10,14 @@ struct prog_infor_t g_emleak_prog;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __be64);
+	__type(key, struct alloc_ctx_key_t);
 	__type(value, __be64);
 	__uint(max_entries, 10240);
 } sizes SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __be64);
+	__type(key, struct alloc_key_t);
 	__type(value, struct alloc_info_t);
 	__uint(max_entries, 1000000);
 } allocs SEC(".maps");
@@ -149,7 +149,7 @@ static inline void update_statistics_del(u64 stack_id, u64 sz) {
     bpf_map_update_elem(&combined_allocs, &stack_id, &cinfo, BPF_ANY);
 }
 
-static inline int gen_alloc_enter(size_t size) {
+static inline int gen_alloc_enter(size_t size, u64 family) {
     if(!user_prog_is_enable()){
         return 0;
     }
@@ -157,9 +157,12 @@ static inline int gen_alloc_enter(size_t size) {
     if (!allocation_filter_matches(size))
         return 0;
 
-    __be64 pid = bpf_get_current_pid_tgid();
+    struct alloc_ctx_key_t key = {
+        .family = family,
+        .pid = bpf_get_current_pid_tgid(),
+    };
     __be64 size64 = size;
-    bpf_map_update_elem(&sizes, &pid, &size64, BPF_ANY);
+    bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY);
 
     if (SHOULD_PRINT)
     {
@@ -170,9 +173,16 @@ static inline int gen_alloc_enter(size_t size) {
     return 0;
 }
 
-static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
-    u64 pid = bpf_get_current_pid_tgid();
-    u64* size64 = bpf_map_lookup_elem(&sizes, &pid);
+static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u64 family) {
+    struct alloc_ctx_key_t size_key = {
+        .family = family,
+        .pid = bpf_get_current_pid_tgid(),
+    };
+    struct alloc_key_t alloc_key = {
+        .family = family,
+        .address = address,
+    };
+    u64* size64 = bpf_map_lookup_elem(&sizes, &size_key);
     struct alloc_info_t info = {0};
 
     if (size64 == 0){
@@ -180,13 +190,16 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
     }
 
     info.size = *size64;
-    bpf_map_delete_elem(&sizes, &pid);
+    bpf_map_delete_elem(&sizes, &size_key);
 
     if (address != 0) {
         info.timestamp_ns = bpf_ktime_get_ns();
         info.stack_id = bpf_get_stackid(ctx, &stack_traces,
                     g_emleak_prog.trace_kernel ? KERNEL_STACK_FLAGS : USER_STACK_FLAGS);
-        bpf_map_update_elem(&allocs, &address, &info, BPF_ANY);
+        struct alloc_info_t *old_info = bpf_map_lookup_elem(&allocs, &alloc_key);
+        if (old_info != 0)
+            update_statistics_del(old_info->stack_id, old_info->size);
+        bpf_map_update_elem(&allocs, &alloc_key, &info, BPF_ANY);
         update_statistics_add(info.stack_id, info.size);
     }
 
@@ -198,38 +211,41 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
     return 0;
 }
 
-static inline int gen_alloc_exit(struct pt_regs *ctx) {
+static inline int gen_alloc_exit(struct pt_regs *ctx, u64 family) {
     if(!user_prog_is_enable()){
         return 0;
     }
 
-    return gen_alloc_exit2(ctx, PT_REGS_RC(ctx));
+    return gen_alloc_exit2(ctx, PT_REGS_RC(ctx), family);
 }
 
-static inline int gen_free_enter(struct pt_regs *ctx, void *address) {
+static inline int gen_free_enter(struct pt_regs *ctx, void *address, u64 family) {
     if(!user_prog_is_enable()){
         return 0;
     }
 
-    u64 addr = (u64)address;
-    struct alloc_info_t *info = bpf_map_lookup_elem(&allocs, &addr);
+    struct alloc_key_t key = {
+        .family = family,
+        .address = (u64)address,
+    };
+    struct alloc_info_t *info = bpf_map_lookup_elem(&allocs, &key);
     if (info == 0){
         return 0;
     }
 
-    bpf_map_delete_elem(&allocs, &addr);
+    bpf_map_delete_elem(&allocs, &key);
 
     update_statistics_del(info->stack_id, info->size);
 
     if (SHOULD_PRINT) {
         char free_fmt[] = "free entered, address = %lx, size = %lu\\n";
-        bpf_trace_printk(free_fmt, sizeof(free_fmt), addr, info->size);
+        bpf_trace_printk(free_fmt, sizeof(free_fmt), key.address, info->size);
     }
     
     return 0;
 }
 
-static inline int gen_kernel_alloc_enter(size_t size)
+static inline int gen_kernel_alloc_enter(size_t size, u64 family)
 {
     if (!kernel_prog_is_enable()) {
         return 0;
@@ -238,37 +254,43 @@ static inline int gen_kernel_alloc_enter(size_t size)
     if (!allocation_filter_matches(size))
         return 0;
 
-    __be64 pid = bpf_get_current_pid_tgid();
+    struct alloc_ctx_key_t key = {
+        .family = family,
+        .pid = bpf_get_current_pid_tgid(),
+    };
     __be64 size64 = size;
 
-    bpf_map_update_elem(&sizes, &pid, &size64, BPF_ANY);
+    bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY);
     return 0;
 }
 
-static inline int gen_kernel_alloc_exit2(void *ctx, u64 address)
+static inline int gen_kernel_alloc_exit2(void *ctx, u64 address, u64 family)
 {
     if (!kernel_prog_is_enable()) {
         return 0;
     }
 
-    return gen_alloc_exit2((struct pt_regs *)ctx, address);
+    return gen_alloc_exit2((struct pt_regs *)ctx, address, family);
 }
 
-static inline int gen_kernel_free_enter(void *ctx, void *address)
+static inline int gen_kernel_free_enter(void *ctx, void *address, u64 family)
 {
-    u64 addr = (u64)address;
+    struct alloc_key_t key = {
+        .family = family,
+        .address = (u64)address,
+    };
     struct alloc_info_t *info;
 
     if (!kernel_prog_is_enable()) {
         return 0;
     }
 
-    info = bpf_map_lookup_elem(&allocs, &addr);
+    info = bpf_map_lookup_elem(&allocs, &key);
     if (info == 0){
         return 0;
     }
 
-    bpf_map_delete_elem(&allocs, &addr);
+    bpf_map_delete_elem(&allocs, &key);
     update_statistics_del(info->stack_id, info->size);
     return 0;
 }
@@ -279,21 +301,21 @@ int malloc_enter(struct pt_regs *ctx)
     int ret = 0;
     size_t size = PT_REGS_PARM1(ctx);
 
-    ret = gen_alloc_enter(size);
+    ret = gen_alloc_enter(size, ALLOC_FAMILY_USER);
     return ret;
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:malloc")
 int malloc_exit(struct pt_regs *ctx)
 {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:free")
 int free_enter(struct pt_regs *ctx) {
     void *address = (void *)PT_REGS_PARM1(ctx);
-    return gen_free_enter(ctx, address);
+    return gen_free_enter(ctx, address, ALLOC_FAMILY_USER);
 }
 
 
@@ -302,12 +324,12 @@ int calloc_enter(struct pt_regs *ctx) {
     size_t nmemb = (size_t)PT_REGS_PARM1(ctx);
     size_t size = (size_t)PT_REGS_PARM2(ctx);
 
-    return gen_alloc_enter(nmemb * size);
+    return gen_alloc_enter(nmemb * size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:calloc")
 int calloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 
@@ -316,24 +338,24 @@ int realloc_enter(struct pt_regs *ctx) {
     void *ptr = (void *)PT_REGS_PARM1(ctx);
     size_t size = (size_t)PT_REGS_PARM2(ctx);
 
-    gen_free_enter(ctx, ptr);
-    return gen_alloc_enter(size);
+    gen_free_enter(ctx, ptr, ALLOC_FAMILY_USER);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:realloc")
 int realloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:mmap")
 int mmap_enter(struct pt_regs *ctx) {
     size_t size = (size_t)PT_REGS_PARM2(ctx);
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:mmap")
 int mmap_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 
@@ -341,7 +363,7 @@ SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:munmap")
 int munmap_enter(struct pt_regs *ctx) {
     void *address = (void *)PT_REGS_PARM1(ctx);
 
-    return gen_free_enter(ctx, address);
+    return gen_free_enter(ctx, address, ALLOC_FAMILY_USER);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:posix_memalign")
@@ -354,7 +376,7 @@ int posix_memalign_enter(struct pt_regs *ctx) {
     u64 pid = bpf_get_current_pid_tgid();
 
     bpf_map_update_elem(&memptrs, &pid, &memptr64, BPF_ANY);
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:posix_memalign")
@@ -372,7 +394,7 @@ int posix_memalign_exit(struct pt_regs *ctx) {
         return 0;
 
     u64 addr64 = (u64)(size_t)addr;
-    return gen_alloc_exit2(ctx, addr64);
+    return gen_alloc_exit2(ctx, addr64, ALLOC_FAMILY_USER);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:aligned_alloc")
@@ -380,24 +402,24 @@ int aligned_alloc_enter(struct pt_regs *ctx) {
     size_t alignment = (size_t)PT_REGS_PARM1(ctx);
     size_t size = (size_t)PT_REGS_PARM2(ctx);
 
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:aligned_alloc")
 int aligned_alloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:valloc")
 int valloc_enter(struct pt_regs *ctx) {
     size_t size = (size_t)PT_REGS_PARM1(ctx);
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:valloc")
 int valloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 
@@ -406,24 +428,24 @@ int memalign_enter(struct pt_regs *ctx) {
     size_t alignment = (size_t)PT_REGS_PARM1(ctx);
     size_t size = (size_t)PT_REGS_PARM2(ctx);
 
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:memalign")
 int memalign_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:pvalloc")
 int pvalloc_enter(struct pt_regs *ctx) {
     size_t size = (size_t)PT_REGS_PARM1(ctx);
 
-    return gen_alloc_enter(size);
+    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:pvalloc")
 int pvalloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx);
+    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 SEC("tp/sched/sched_process_exec")
@@ -486,21 +508,21 @@ int BPF_KPROBE(malloc_add)
 	int ret = 0;
     size_t size = PT_REGS_PARM1(ctx);
 
-    ret = gen_alloc_enter(size);
+    ret = gen_alloc_enter(size, ALLOC_FAMILY_USER);
     return ret;
 }
 
 SEC("uretprobe")
 int BPF_KRETPROBE(retmalloc_add)
 {
-	return gen_alloc_exit(ctx);
+	return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
 }
 
 SEC("uprobe")
 int BPF_KRETPROBE(free_add)
 {
 	void *address = (void *)PT_REGS_PARM1(ctx);
-    return gen_free_enter(ctx, address);
+    return gen_free_enter(ctx, address, ALLOC_FAMILY_USER);
 }
 
 SEC("tp/kmem/kmalloc")
@@ -509,8 +531,8 @@ int handle_kmalloc(struct trace_event_raw_kmalloc *ctx)
     size_t size = ctx->bytes_alloc;
     u64 ptr = (u64)ctx->ptr;
 
-    gen_kernel_alloc_enter(size);
-    return gen_kernel_alloc_exit2(ctx, ptr);
+    gen_kernel_alloc_enter(size, ALLOC_FAMILY_KERNEL_SLAB);
+    return gen_kernel_alloc_exit2(ctx, ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/kmalloc_node")
@@ -519,8 +541,8 @@ int handle_kmalloc_node(struct trace_event_raw_kmalloc *ctx)
     size_t size = ctx->bytes_alloc;
     u64 ptr = (u64)ctx->ptr;
 
-    gen_kernel_alloc_enter(size);
-    return gen_kernel_alloc_exit2(ctx, ptr);
+    gen_kernel_alloc_enter(size, ALLOC_FAMILY_KERNEL_SLAB);
+    return gen_kernel_alloc_exit2(ctx, ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/kmem_cache_alloc")
@@ -529,8 +551,8 @@ int handle_kmem_cache_alloc(struct trace_event_raw_kmem_cache_alloc *ctx)
     size_t size = ctx->bytes_alloc;
     u64 ptr = (u64)ctx->ptr;
 
-    gen_kernel_alloc_enter(size);
-    return gen_kernel_alloc_exit2(ctx, ptr);
+    gen_kernel_alloc_enter(size, ALLOC_FAMILY_KERNEL_SLAB);
+    return gen_kernel_alloc_exit2(ctx, ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/kmem_cache_alloc_node")
@@ -539,36 +561,36 @@ int handle_kmem_cache_alloc_node(struct trace_event_raw_kmem_cache_alloc *ctx)
     size_t size = ctx->bytes_alloc;
     u64 ptr = (u64)ctx->ptr;
 
-    gen_kernel_alloc_enter(size);
-    return gen_kernel_alloc_exit2(ctx, ptr);
+    gen_kernel_alloc_enter(size, ALLOC_FAMILY_KERNEL_SLAB);
+    return gen_kernel_alloc_exit2(ctx, ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/kfree")
 int handle_kfree(struct trace_event_raw_kfree *ctx)
 {
-    return gen_kernel_free_enter(ctx, (void *)ctx->ptr);
+    return gen_kernel_free_enter(ctx, (void *)ctx->ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/kmem_cache_free")
 int handle_kmem_cache_free(struct trace_event_raw_kmem_cache_free *ctx)
 {
-    return gen_kernel_free_enter(ctx, (void *)ctx->ptr);
+    return gen_kernel_free_enter(ctx, (void *)ctx->ptr, ALLOC_FAMILY_KERNEL_SLAB);
 }
 
 SEC("tp/kmem/mm_page_alloc")
 int handle_mm_page_alloc(struct trace_event_raw_mm_page_alloc *ctx)
 {
-    u64 addr = ctx->pfn << 12;
-    u64 size = PAGE_SIZE_BYTES << ctx->order;
+    u64 addr = ctx->pfn;
+    u64 size = g_emleak_prog.page_size << ctx->order;
 
-    gen_kernel_alloc_enter(size);
-    return gen_kernel_alloc_exit2(ctx, addr);
+    gen_kernel_alloc_enter(size, ALLOC_FAMILY_KERNEL_PAGE);
+    return gen_kernel_alloc_exit2(ctx, addr, ALLOC_FAMILY_KERNEL_PAGE);
 }
 
 SEC("tp/kmem/mm_page_free")
 int handle_mm_page_free(struct trace_event_raw_mm_page_free *ctx)
 {
-    u64 addr = ctx->pfn << 12;
+    u64 addr = ctx->pfn;
 
-    return gen_kernel_free_enter(ctx, (void *)addr);
+    return gen_kernel_free_enter(ctx, (void *)addr, ALLOC_FAMILY_KERNEL_PAGE);
 }

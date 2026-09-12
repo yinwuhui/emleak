@@ -14,7 +14,12 @@
 #define SAMPLE_EVERY_N 5
 #define USER_STACK_FLAGS (0 | BPF_F_USER_STACK)
 #define KERNEL_STACK_FLAGS 0
-#define PAGE_SIZE_BYTES 4096
+
+enum alloc_family_e {
+        ALLOC_FAMILY_USER = 1,
+        ALLOC_FAMILY_KERNEL_SLAB = 2,
+        ALLOC_FAMILY_KERNEL_PAGE = 3,
+};
 
 typedef __s8  s8;
 typedef __u8  u8;
@@ -39,6 +44,16 @@ struct alloc_info_t {
         int stack_id;
 };
 
+struct alloc_key_t {
+        u64 family;
+        u64 address;
+};
+
+struct alloc_ctx_key_t {
+        u64 family;
+        u64 pid;
+};
+
 struct combined_alloc_info_t {
         __be64 total_size;
         __be64 number_of_allocs;
@@ -54,6 +69,7 @@ struct prog_infor_t {
         u64 sample_rate;                        /**< 每N次采样一次*/
         u64 min_size;                           /**< 最小分配大小*/
         u64 max_size;                           /**< 最大分配大小，0表示不限制*/
+        u64 page_size;                           /**< 系统页大小*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/

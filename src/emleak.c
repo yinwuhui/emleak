@@ -641,7 +641,7 @@ void add_stack_node(struct stack_node **stackmaps, int stack_id, int memsize) {
 
 void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
 {
-	__u64 prev_key, key;
+	struct alloc_key_t prev_key = {}, key = {};
 	__u64 now_ns = 0;
 	struct alloc_info_t alloc_info;
 	struct stack_node *stackmaps = NULL;
@@ -652,7 +652,6 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 		now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
 	}
 
-	prev_key = 0;
 	while (bpf_map_get_next_key(g_allocs_fd, &prev_key, &key) == 0) 
 	{
 		if (bpf_map_lookup_elem(g_allocs_fd, &key, &alloc_info) != 0) {
@@ -722,6 +721,11 @@ int get_executable_path_by_pid(int pid, char *path_buf, size_t buf_size)
 
 static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 {
+	long page_size = sysconf(_SC_PAGESIZE);
+
+	if (page_size <= 0)
+		page_size = 4096;
+	skel->bss->g_emleak_prog.page_size = page_size;
 	skel->bss->g_emleak_prog.filter_pid = paras->trace_kernel ? paras->pid : 0;
 	skel->bss->g_emleak_prog.filter_cgroup_id = paras->cgroup_id;
 	skel->bss->g_emleak_prog.filter_comm_enabled = paras->comm_filter;
@@ -774,16 +778,19 @@ set_start_time:
 
 static void old_environment_clean(void)
 {
+	struct alloc_ctx_key_t size_prev_key = {}, size_key = {};
+	struct alloc_key_t alloc_prev_key = {}, alloc_key = {};
 	__u64 prev_key = 0, key = 0;
 	__u32 prev_key1 = 0, key1 = 0;
 
-	while (bpf_map_get_next_key(g_sizes_fd, &prev_key, &key) == 0){
-		bpf_map_delete_elem(g_sizes_fd, &key);
+	while (bpf_map_get_next_key(g_sizes_fd, &size_prev_key, &size_key) == 0){
+		bpf_map_delete_elem(g_sizes_fd, &size_key);
+		size_prev_key = size_key;
 	}
 
-	prev_key = 0;
-	while (bpf_map_get_next_key(g_allocs_fd, &prev_key, &key) == 0){
-		bpf_map_delete_elem(g_allocs_fd, &key);
+	while (bpf_map_get_next_key(g_allocs_fd, &alloc_prev_key, &alloc_key) == 0){
+		bpf_map_delete_elem(g_allocs_fd, &alloc_key);
+		alloc_prev_key = alloc_key;
 	}
 
 	prev_key = 0;
