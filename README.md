@@ -58,6 +58,11 @@ OPTS:
     -i    interval in seconds to print outstanding allocations
     -k    trace kernel memory allocations globally
     --kernel-pages    additionally trace page allocator events
+    --cgroup PATH     filter allocations by cgroup path
+    --sample-rate N   sample roughly one allocation in N
+    --min-size BYTES  trace allocations at least this size
+    --max-size BYTES  trace allocations at most this size
+    --older MS        report only allocations older than MS milliseconds
 
 ./emleak -p 12356
 #指定进程pid跟踪，默认10s记录一次内存信息到文件.
@@ -73,6 +78,12 @@ OPTS:
 sudo ./emleak -k -i 5
 #跟踪内核 kmalloc/slab 分配和释放，使用内核调用栈定位未释放对象。
 #内核模式是全局跟踪，可能包含跟踪器自身及系统服务产生的分配。
+
+sudo ./emleak -k --pid 1234 --sample-rate 10 --min-size 4096 --older 500
+#只跟踪指定进程触发的内核分配，每10次采样一次，仅保留至少4KiB且持续超过500ms的对象。
+
+sudo ./emleak -k --comm kworker/u8:1 --cgroup /sys/fs/cgroup/my-service
+#按内核线程名和cgroup限制内核分配跟踪范围。
 
 sudo ./emleak -k --kernel-pages -i 5
 #额外跟踪页分配器事件；事件量较大，适合短时间定位物理页级问题。

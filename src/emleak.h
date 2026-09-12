@@ -23,6 +23,13 @@ struct emleakpara{
     char ffuncname[MAXFILELEN];            /**< 释放内存的API名字*/
     int trace_kernel;                      /**< 跟踪内核内存*/
     int trace_kernel_pages;                /**< 跟踪内核页分配*/
+    int comm_filter;                       /**< 是否启用comm过滤*/
+    char cgroup_path[MAXFILELEN];          /**< cgroup路径*/
+    uint64_t cgroup_id;                    /**< cgroup ID*/
+    uint64_t sample_rate;                  /**< 每N次采样一次*/
+    uint64_t min_size;                     /**< 最小分配大小*/
+    uint64_t max_size;                     /**< 最大分配大小*/
+    uint64_t older_ns;                     /**< 只保留超过该年龄的对象*/
 };
 
 struct stack_node {
@@ -30,11 +37,6 @@ struct stack_node {
     int memtimes;                    /*申请的总次数*/
     int memsum;                      /*call stak memleak的总大小*/
     UT_hash_handle hh;               /* makes this structure hashable */
-};
-
-struct ksym {
-	unsigned long addr;
-	char *name;
 };
 
 struct statistical{

@@ -48,6 +48,12 @@ struct prog_infor_t {
         u64 prog_pid;                          /**< 进程pid*/
         volatile enum progstate_e prog_state;  /**< 进程状态*/
         u64 trace_kernel;                      /**< 是否跟踪内核内存*/
+        u64 filter_pid;                         /**< 内核模式PID过滤*/
+        u64 filter_cgroup_id;                   /**< cgroup过滤*/
+        u64 filter_comm_enabled;                /**< 是否启用comm过滤*/
+        u64 sample_rate;                        /**< 每N次采样一次*/
+        u64 min_size;                           /**< 最小分配大小*/
+        u64 max_size;                           /**< 最大分配大小，0表示不限制*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/

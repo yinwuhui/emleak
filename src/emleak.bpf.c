@@ -62,6 +62,50 @@ static inline int user_prog_is_enable()
     return 1;
 }
 
+static inline int commcmp(char *cmp1, char *cmp2){
+    int i = 0;
+    for(i = 0; i < TASK_COMM_LEN; i++){
+        if(cmp1[i] != cmp2[i]){
+            return 1;
+        }
+
+        if(cmp1[i] == '\0'){
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static inline int allocation_filter_matches(size_t size)
+{
+    __u64 tgid = bpf_get_current_pid_tgid() >> 32;
+    __u64 cgroup_id;
+    char comm[TASK_COMM_LEN] = {};
+
+    if (g_emleak_prog.filter_pid && tgid != g_emleak_prog.filter_pid)
+        return 0;
+    if (g_emleak_prog.filter_cgroup_id) {
+        cgroup_id = bpf_get_current_cgroup_id();
+        if (cgroup_id != g_emleak_prog.filter_cgroup_id)
+            return 0;
+    }
+    if (g_emleak_prog.filter_comm_enabled) {
+        bpf_get_current_comm(comm, sizeof(comm));
+        if (commcmp(comm, g_emleak_prog.prog_comm) != 0)
+            return 0;
+    }
+    if (g_emleak_prog.min_size && size < g_emleak_prog.min_size)
+        return 0;
+    if (g_emleak_prog.max_size && size > g_emleak_prog.max_size)
+        return 0;
+    if (g_emleak_prog.sample_rate > 1
+            && bpf_get_prandom_u32() % g_emleak_prog.sample_rate != 0)
+        return 0;
+
+    return 1;
+}
+
 static inline int kernel_prog_is_enable()
 {
     return g_emleak_prog.trace_kernel
@@ -110,13 +154,8 @@ static inline int gen_alloc_enter(size_t size) {
         return 0;
     }
 
-    if (SAMPLE_EVERY_N > 1) 
-    {
-        u64 ts = bpf_ktime_get_ns();
-        if (ts % SAMPLE_EVERY_N != 0){
-            return 0;
-        } 
-    }
+    if (!allocation_filter_matches(size))
+        return 0;
 
     __be64 pid = bpf_get_current_pid_tgid();
     __be64 size64 = size;
@@ -195,6 +234,9 @@ static inline int gen_kernel_alloc_enter(size_t size)
     if (!kernel_prog_is_enable()) {
         return 0;
     }
+
+    if (!allocation_filter_matches(size))
+        return 0;
 
     __be64 pid = bpf_get_current_pid_tgid();
     __be64 size64 = size;
@@ -382,21 +424,6 @@ int pvalloc_enter(struct pt_regs *ctx) {
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:pvalloc")
 int pvalloc_exit(struct pt_regs *ctx) {
     return gen_alloc_exit(ctx);
-}
-
-static inline int commcmp(char *cmp1, char *cmp2){
-    int i = 0;
-    for(i = 0; i < TASK_COMM_LEN; i++){
-        if(cmp1[i] != cmp2[i]){
-            return 1;
-        }
-
-        if(cmp1[i] == '\0'){
-            return 0;
-        }
-    }
-
-    return 1;
 }
 
 SEC("tp/sched/sched_process_exec")

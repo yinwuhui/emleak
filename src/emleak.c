@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <limits.h>
 
 #define __USE_GNU
 #include <dlfcn.h>
@@ -64,6 +66,11 @@ static const char *__doc__ =
 "    -i    interval in seconds to print outstanding allocations \n"
 "    -k    trace kernel allocations \n"
 "    --kernel-pages trace kernel page allocator too \n"
+"    --cgroup PATH    filter allocations by cgroup path \n"
+"    --sample-rate N  sample roughly one allocation in N \n"
+"    --min-size BYTES only trace allocations at least this size \n"
+"    --max-size BYTES only trace allocations at most this size \n"
+"    --older MS       report only allocations older than MS milliseconds \n"
 "    -m    set you customized malloc function. ex(-m my_malloc) \n"
 "    -f    set you customized free function. ex(-m my_free) \n";
 
@@ -74,103 +81,86 @@ static const struct option long_options[] = {
 	{ "interval", required_argument, NULL, 'i' },
 	{ "kernel", no_argument, NULL, 'k' },
 	{ "kernel-pages", no_argument, NULL, 1000 },
+	{ "cgroup", required_argument, NULL, 1001 },
+	{ "sample-rate", required_argument, NULL, 1002 },
+	{ "min-size", required_argument, NULL, 1003 },
+	{ "max-size", required_argument, NULL, 1004 },
+	{ "older", required_argument, NULL, 1005 },
 	{ "malloc", required_argument, NULL, 'm' },
 	{ "free", required_argument, NULL, 'f' },
 	{}
 };
 
-static struct ksym *g_ksyms;
-static int g_ksyms_num;
+static void *g_kernel_syms;
 
-static int ksym_cmp(const void *a, const void *b)
+static int parse_u64_option(const char *arg, uint64_t *value)
 {
-	const struct ksym *ka = a;
-	const struct ksym *kb = b;
+	char *end = NULL;
+	unsigned long long parsed;
 
-	if (ka->addr < kb->addr)
+	errno = 0;
+	parsed = strtoull(arg, &end, 0);
+	if (errno || end == arg || *end != '\0')
 		return -1;
-	if (ka->addr > kb->addr)
-		return 1;
+	*value = parsed;
+	return 0;
+}
+
+static int load_cgroup_id(struct emleakpara *paras)
+{
+	struct stat cgroup_stat;
+
+	if (!paras->cgroup_path[0])
+		return 0;
+	if (stat(paras->cgroup_path, &cgroup_stat) != 0) {
+		fprintf(stderr, "Failed to stat cgroup path %s: %s\n",
+				paras->cgroup_path, strerror(errno));
+		return -1;
+	}
+	if (!S_ISDIR(cgroup_stat.st_mode) || cgroup_stat.st_ino == 0) {
+		fprintf(stderr, "Cgroup path is not a valid cgroup directory: %s\n",
+				paras->cgroup_path);
+		return -1;
+	}
+
+	paras->cgroup_id = cgroup_stat.st_ino;
 	return 0;
 }
 
 static int kernel_syms_load(void)
 {
-	FILE *fp;
-	char line[512];
-	int capacity = 0;
-
-	fp = fopen("/proc/kallsyms", "r");
-	if (!fp) {
-		perror("fopen /proc/kallsyms");
+	g_kernel_syms = bcc_symcache_new(-1, NULL);
+	if (!g_kernel_syms) {
+		fprintf(stderr, "Failed to load kernel symbols through libbcc.\n");
 		return -1;
 	}
 
-	while (fgets(line, sizeof(line), fp)) {
-		unsigned long addr;
-		char type;
-		char name[SYMBOL_NAME_LEN];
-
-		if (sscanf(line, "%lx %c %127s", &addr, &type, name) != 3)
-			continue;
-		if (addr == 0)
-			continue;
-
-		if (g_ksyms_num == capacity) {
-			struct ksym *new_syms;
-
-			capacity = capacity ? capacity * 2 : 4096;
-			new_syms = realloc(g_ksyms, capacity * sizeof(*g_ksyms));
-			if (!new_syms) {
-				fclose(fp);
-				return -1;
-			}
-			g_ksyms = new_syms;
-		}
-
-		g_ksyms[g_ksyms_num].addr = addr;
-		g_ksyms[g_ksyms_num].name = strdup(name);
-		if (!g_ksyms[g_ksyms_num].name) {
-			fclose(fp);
-			return -1;
-		}
-		g_ksyms_num++;
-	}
-
-	fclose(fp);
-	qsort(g_ksyms, g_ksyms_num, sizeof(*g_ksyms), ksym_cmp);
-	printf("Loaded kernel symbols, num = %d.\n", g_ksyms_num);
-	return g_ksyms_num > 0 ? 0 : -1;
+	printf("Loaded kernel symbols through libbcc.\n");
+	return 0;
 }
 
 static int kernel_symbol_resolve(uint64_t addr, struct proc_symbol *symbol)
 {
-	int left = 0;
-	int right = g_ksyms_num - 1;
-	int best = -1;
+	struct bcc_symbol bccsymbol = {};
 
-	if (!symbol || !symbol->name || g_ksyms_num <= 0)
+	if (!symbol || !symbol->name || !g_kernel_syms)
 		return -1;
 
-	while (left <= right) {
-		int mid = left + (right - left) / 2;
-
-		if (g_ksyms[mid].addr <= addr) {
-			best = mid;
-			left = mid + 1;
-		} else {
-			right = mid - 1;
-		}
-	}
-
-	if (best < 0) {
+	if (bcc_symcache_resolve_no_demangle(g_kernel_syms, addr, &bccsymbol) != 0
+			|| !bccsymbol.name) {
 		strcpy(symbol->name, "[UNKNOWN]");
+		strcpy(symbol->module, "[UNKNOWN]");
 		symbol->offset = 0;
 		return -1;
 	}
 
-	snprintf(symbol->name, SYMBOL_NAME_LEN, "%s", g_ksyms[best].name);
-	symbol->offset = addr - g_ksyms[best].addr;
+	snprintf(symbol->name, SYMBOL_NAME_LEN, "%s", bccsymbol.name);
+	if (bccsymbol.module) {
+		snprintf(symbol->module, SYMBOL_NAME_LEN, "%s", bccsymbol.module);
+	} else {
+		symbol->module[0] = '\0';
+	}
+	symbol->offset = bccsymbol.offset;
 	return 0;
 }
 
@@ -280,11 +270,12 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			paras->pid = strtoul(optarg, NULL, 0);
 			break;
 		case 'c':
-			if(strlen(optarg) > TASK_COMM_LEN){
+			if(strlen(optarg) >= TASK_COMM_LEN){
 				error = true;
 				goto err_out;
 			}
 			strcpy(paras->prog_comm, optarg);
+			paras->comm_filter = 1;
 			break;
 		case 'i':
 			paras->interval = strtoul(optarg, NULL, 0);
@@ -296,6 +287,43 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			paras->trace_kernel = 1;
 			paras->trace_kernel_pages = 1;
 			break;
+		case 1001:
+			if (strlen(optarg) >= MAXFILELEN) {
+				error = true;
+				goto err_out;
+			}
+			strcpy(paras->cgroup_path, optarg);
+			break;
+		case 1002:
+			if (parse_u64_option(optarg, &paras->sample_rate) != 0
+					|| paras->sample_rate == 0) {
+				error = true;
+				goto err_out;
+			}
+			break;
+		case 1003:
+			if (parse_u64_option(optarg, &paras->min_size) != 0) {
+				error = true;
+				goto err_out;
+			}
+			break;
+		case 1004:
+			if (parse_u64_option(optarg, &paras->max_size) != 0) {
+				error = true;
+				goto err_out;
+			}
+			break;
+		case 1005: {
+			uint64_t older_ms;
+
+			if (parse_u64_option(optarg, &older_ms) != 0
+					|| older_ms > UINT64_MAX / 1000000ULL) {
+				error = true;
+				goto err_out;
+			}
+			paras->older_ns = older_ms * 1000000ULL;
+			break;
+		}
 		case 'm':
 			if(strlen(optarg) > MAXFILELEN){
 				error = true;
@@ -317,6 +345,13 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			error = true;
 			goto err_out;
 		}
+	}
+
+	if (paras->sample_rate == 0)
+		paras->sample_rate = 1;
+	if (paras->max_size && paras->min_size > paras->max_size) {
+		error = true;
+		goto err_out;
 	}
 
 	return ret;
@@ -393,7 +428,12 @@ static void print_stacks(struct stack_node **stackmaps, char *outfilename)
 				break;
 			}
 
-			PRINT_STACK(fp, "\t%s+0x%lx;\n", symbol.name, symbol.offset);
+			if (cmdparas.trace_kernel && symbol.module[0]) {
+				PRINT_STACK(fp, "\t%s+0x%lx [%s];\n",
+						symbol.name, symbol.offset, symbol.module);
+			} else {
+				PRINT_STACK(fp, "\t%s+0x%lx;\n", symbol.name, symbol.offset);
+			}
 		}
     }
 
@@ -602,13 +642,29 @@ void add_stack_node(struct stack_node **stackmaps, int stack_id, int memsize) {
 void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
 {
 	__u64 prev_key, key;
+	__u64 now_ns = 0;
 	struct alloc_info_t alloc_info;
 	struct stack_node *stackmaps = NULL;
+	struct timespec now;
+
+	if (cmdparas.older_ns) {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+	}
 
 	prev_key = 0;
 	while (bpf_map_get_next_key(g_allocs_fd, &prev_key, &key) == 0) 
 	{
-		bpf_map_lookup_elem(g_allocs_fd, &key, &alloc_info);
+		if (bpf_map_lookup_elem(g_allocs_fd, &key, &alloc_info) != 0) {
+			prev_key = key;
+			continue;
+		}
+
+		if (cmdparas.older_ns && now_ns > alloc_info.timestamp_ns
+				&& now_ns - alloc_info.timestamp_ns < cmdparas.older_ns) {
+			prev_key = key;
+			continue;
+		}
 
 		if(alloc_info.stack_id < 0){
 			prev_key = key;
@@ -666,6 +722,13 @@ int get_executable_path_by_pid(int pid, char *path_buf, size_t buf_size)
 
 static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 {
+	skel->bss->g_emleak_prog.filter_pid = paras->trace_kernel ? paras->pid : 0;
+	skel->bss->g_emleak_prog.filter_cgroup_id = paras->cgroup_id;
+	skel->bss->g_emleak_prog.filter_comm_enabled = paras->comm_filter;
+	skel->bss->g_emleak_prog.sample_rate = paras->sample_rate;
+	skel->bss->g_emleak_prog.min_size = paras->min_size;
+	skel->bss->g_emleak_prog.max_size = paras->max_size;
+
 	if (paras->trace_kernel) {
 		skel->bss->g_emleak_prog.trace_kernel = 1;
 		skel->bss->g_emleak_prog.prog_pid = 0;
@@ -937,6 +1000,8 @@ int main(int argc, char **argv)
 
 		return -1;
 	}
+	if (load_cgroup_id(&cmdparas) != 0)
+		return -1;
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
@@ -1029,6 +1094,8 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
+	if (g_kernel_syms)
+		bcc_free_symcache(g_kernel_syms, -1);
 	emleak_bpf__destroy(skel);
 	return -err;
 }
