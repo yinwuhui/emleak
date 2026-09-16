@@ -11,12 +11,12 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
-#include <pwd.h>
 
 #define __USE_GNU
 #include <dlfcn.h>
@@ -47,14 +47,15 @@ struct emleakpara cmdparas = {
 	.prog_comm = "a.out",
 	.interval = 10,
 	.sample_rate = 1,
-	.top_n = 10,
+	.top_n = 0,
 	.mode = EMLEAK_MODE_RECORD,
 };
 
-int g_exiting = 0;
-volatile int g_signal = 0;
+static volatile sig_atomic_t g_exiting;
+static volatile sig_atomic_t g_signal;
 
 static int g_sizes_fd;
+static int g_realloc_ptrs_fd;
 static int g_allocs_fd;
 static int g_memptrs_fd;
 static int g_stack_traces_fd;
@@ -63,6 +64,10 @@ static uint64_t g_last_alloc_events;
 static uint64_t g_last_free_events;
 static uint64_t g_last_total_bytes;
 static uint64_t g_last_snapshot_ns;
+
+static int attach_user_allocator(struct emleak_bpf *skeleton, pid_t pid);
+int user_defined_func_attach(struct emleak_bpf *skel, char *elf_pwd,
+		char *malloc_func, char *free_func, pid_t pid);
 
 static uint64_t read_meminfo_kb(const char *name)
 {
@@ -120,15 +125,6 @@ static void print_system_memory_header(void)
 			(swap_total - swap_free) / 1024.0);
 }
 
-static const char *current_user_name(void)
-{
-	struct passwd *user = getpwuid(geteuid());
-
-	return user && user->pw_name ? user->pw_name : "unknown";
-}
-
-pthread_mutex_t g_perf_event_mutex;  /*Avoid  kernel event and user sigfun printing at the same time*/
-
 static const char *__doc__ = 
 "usage: %s [OPTS] \n"
 "   Trace outstanding memory allocations that weren't freed.\n"
@@ -145,10 +141,23 @@ static const char *__doc__ =
 "    --min-size BYTES only trace allocations at least this size \n"
 "    --max-size BYTES only trace allocations at most this size \n"
 "    --older MS       report only allocations older than MS milliseconds \n"
-"    --top N          show N stacks in top mode (default 10) \n"
+	"    --top N          limit top mode to N rows (default fills terminal) \n"
+	"    --show-stacks    show resolved stack details in top mode \n"
 "    --duration SEC   stop record mode after SEC seconds \n"
 "    -m    set you customized malloc function. ex(-m my_malloc) \n"
-"    -f    set you customized free function. ex(-m my_free) \n";
+	"    -f    set you customized free function. ex(-m my_free) \n";
+
+static uid_t output_owner_uid(void)
+{
+	const char *sudo_uid = getenv("SUDO_UID");
+	char *end;
+	unsigned long uid;
+
+	if (!sudo_uid)
+		return getuid();
+	uid = strtoul(sudo_uid, &end, 10);
+	return *end == '\0' ? (uid_t)uid : getuid();
+}
 
 static const struct option long_options[] = {
 	{ "help", no_argument, NULL, 'h' },
@@ -164,6 +173,7 @@ static const struct option long_options[] = {
 	{ "older", required_argument, NULL, 1005 },
 	{ "top", required_argument, NULL, 1006 },
 	{ "duration", required_argument, NULL, 1007 },
+	{ "show-stacks", no_argument, NULL, 1008 },
 	{ "malloc", required_argument, NULL, 'm' },
 	{ "free", required_argument, NULL, 'f' },
 	{}
@@ -278,6 +288,21 @@ static void set_user_programs_autoload(struct emleak_bpf *skel, bool autoload)
 	bpf_program__set_autoload(skel->progs.free_add, autoload);
 }
 
+static void set_user_programs_autoattach(struct emleak_bpf *skel, bool autoattach)
+{
+	#define SET_AUTOATTACH(name) bpf_program__set_autoattach(skel->progs.name, autoattach)
+	SET_AUTOATTACH(malloc_enter); SET_AUTOATTACH(malloc_exit); SET_AUTOATTACH(free_enter);
+	SET_AUTOATTACH(calloc_enter); SET_AUTOATTACH(calloc_exit); SET_AUTOATTACH(realloc_enter);
+	SET_AUTOATTACH(realloc_exit); SET_AUTOATTACH(mmap_enter); SET_AUTOATTACH(mmap_exit);
+	SET_AUTOATTACH(munmap_enter); SET_AUTOATTACH(posix_memalign_enter);
+	SET_AUTOATTACH(posix_memalign_exit); SET_AUTOATTACH(aligned_alloc_enter);
+	SET_AUTOATTACH(aligned_alloc_exit); SET_AUTOATTACH(valloc_enter); SET_AUTOATTACH(valloc_exit);
+	SET_AUTOATTACH(memalign_enter); SET_AUTOATTACH(memalign_exit); SET_AUTOATTACH(pvalloc_enter);
+	SET_AUTOATTACH(pvalloc_exit); SET_AUTOATTACH(malloc_add); SET_AUTOATTACH(retmalloc_add);
+	SET_AUTOATTACH(free_add);
+	#undef SET_AUTOATTACH
+}
+
 static void set_kernel_programs_autoload(struct emleak_bpf *skel, bool autoload, bool trace_pages)
 {
 	bpf_program__set_autoload(skel->progs.handle_kmalloc,
@@ -306,7 +331,9 @@ static void configure_bpf_programs(struct emleak_bpf *skel, struct emleakpara *p
 		bpf_program__set_autoload(skel->progs.handle_exit, false);
 		set_kernel_programs_autoload(skel, true, paras->trace_kernel_pages);
 	} else {
+		/* Standard libc probes are attached explicitly to the selected PID. */
 		set_user_programs_autoload(skel, true);
+		set_user_programs_autoattach(skel, false);
 		bpf_program__set_autoload(skel->progs.handle_exec, true);
 		bpf_program__set_autoload(skel->progs.handle_exit, true);
 		set_kernel_programs_autoload(skel, false, false);
@@ -412,12 +439,15 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			paras->top_n = top_n;
 			break;
 		}
-		case 1007:
+	case 1007:
 			if (parse_u64_option(optarg, &paras->duration) != 0) {
 				error = true;
 				goto err_out;
 			}
-			break;
+		break;
+	case 1008:
+		paras->show_stacks = 1;
+		break;
 		case 'm':
 			if(strlen(optarg) > MAXFILELEN){
 				error = true;
@@ -456,13 +486,24 @@ err_out:
 }
 
 int cmp_by_memsum(const struct stack_node *a, const struct stack_node *b) {
-    if(a->memsum < b->memsum){
+	    if(a->memsum > b->memsum){
 		return -1;
 	}else if(a->memsum == b->memsum){
 		return 0;
 	}else{
 		return 1;
 	}
+}
+
+static int top_display_limit(void)
+{
+	struct winsize window = {};
+	int rows = 24;
+
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0 && window.ws_row)
+		rows = window.ws_row;
+	/* System summary, emleak summary, table header, and event status use 10 rows. */
+	return rows > 10 ? rows - 10 : 1;
 }
 
 void p_symbol_init(struct proc_symbol *symbol)
@@ -500,13 +541,16 @@ static void print_stacks(struct stack_node **stackmaps, char *outfilename)
 
 	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next) 
 	{
-        if (bpf_map_lookup_elem(g_stack_traces_fd, &tmpnode->stack_id, progstack) != 0) {
+	        if (tmpnode->key.stack_id < 0
+				|| bpf_map_lookup_elem(g_stack_traces_fd, &tmpnode->key.stack_id, progstack) != 0) {
 			printf("---;");
 			continue;
 		} 
 		
-		PRINT_STACK(fp, "%llu bytes allocated at callstack id %d: \n",
-				(unsigned long long)tmpnode->memsum, tmpnode->stack_id);
+		PRINT_STACK(fp, "%llu bytes allocated by pid %llu (%s), stack id %d: \n",
+				(unsigned long long)tmpnode->memsum,
+				(unsigned long long)tmpnode->key.tgid, tmpnode->key.comm,
+				tmpnode->key.stack_id);
 
 		for (int i = 0; i < PERF_MAX_STACK_DEPTH ; i++)
 		{
@@ -557,10 +601,15 @@ static void print_summary(struct stack_node **stackmaps, char *outfilename)
 	}
 
 	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next){
-		snprintf(buffer, MAX_BUFF_LEN, "%d, %llu, %llu \n",
-						tmpnode->stack_id,
+			snprintf(buffer, MAX_BUFF_LEN, "%llu,%s,%llu,%d,%llu,%llu,%llu,%llu\n",
+						(unsigned long long)tmpnode->key.tgid,
+						tmpnode->key.comm,
+						(unsigned long long)tmpnode->key.family,
+						tmpnode->key.stack_id,
 						(unsigned long long)tmpnode->memsum,
-						(unsigned long long)tmpnode->memtimes);
+						(unsigned long long)tmpnode->memtimes,
+						(unsigned long long)tmpnode->allocated_bytes,
+						(unsigned long long)tmpnode->freed_bytes);
 		fwrite(buffer, 1, strlen(buffer), fp);
 	}
 
@@ -576,6 +625,7 @@ int outfiles_init(int pid, struct emleakpara *para)
 	char path[MAXFILELEN/2] = {0}; 
     struct stat sb;
 	FILE* fp = NULL;
+	uid_t owner = output_owner_uid();
 	memset(&sb, 0x00, sizeof(sb));
 
 	if(para == NULL)
@@ -586,37 +636,44 @@ int outfiles_init(int pid, struct emleakpara *para)
 	
 	/* Use the process pid and current time as the 
 	 * name of the output directory*/
-	sprintf(path, "mleak_pid%d_time%ld", pid, time(NULL));
+	if (snprintf(path, sizeof(path), "mleak_pid%d_time%ld", pid, time(NULL))
+			>= (int)sizeof(path))
+		return -1;
 
-    if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        printf("Folder already exists.\n");
+	if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+	        printf("Folder already exists.\n");
 
-    } else {
-        if (mkdir(path, 0777) == 0) {
-            printf("Folder created.\n");
-        } else {
-            printf("Failed to create folder.\n");
-        }
-    }
+	} else {
+		if (mkdir(path, 0750) == 0) {
+	            printf("Folder created.\n");
+	        } else {
+	            printf("Failed to create folder.\n");
+	        }
+	}
+	if (chown(path, owner, (gid_t)-1) != 0 && errno != EPERM)
+		fprintf(stderr, "Failed to set output owner for %s: %s\n", path, strerror(errno));
 
 	snprintf(para->stackfile, MAXFILELEN, "%s/%s", path, STACK_OUTFILE_NAME);
 	snprintf(para->summaryfile, MAXFILELEN, "%s/%s", path, SUMMARY_OUTFILE_NAME);
 	snprintf(para->statisticalfile, MAXFILELEN, "%s/%s", path, STATICS_OUTFILE_NAME);
+	snprintf(para->foldedfile, MAXFILELEN, "%s/%s", path, FOLDED_OUTFILE_NAME);
+	snprintf(para->healthfile, MAXFILELEN, "%s/%s", path, HEALTH_OUTFILE_NAME);
 
 	fp = fopen(para->stackfile, "w");
     if (fp == NULL) {
         printf("Failed to create stackfile file.\n");
 		return -1;
-    } else {
-        fclose(fp); 
-    }
+	} else {
+		fclose(fp);
+	}
 
 	fp = fopen(para->summaryfile, "w");
     if (fp == NULL) {
         printf("Failed to create summaryfile file.\n");
 		return -1;
     } else {
-        fclose(fp); 
+		fputs("tgid,comm,family,stack_id,bytes,objects,allocated_bytes,freed_bytes\n", fp);
+		fclose(fp);
     }
 
 	fp = fopen(para->statisticalfile, "w");
@@ -624,117 +681,153 @@ int outfiles_init(int pid, struct emleakpara *para)
         printf("Failed to create statisticalfile file.\n");
 		return -1;
     } else {
-        fclose(fp); 
-    }
+		fputs("timestamp_ns,tgid,comm,family,stack_id,bytes,objects,allocated_bytes,freed_bytes\n", fp);
+		fclose(fp);
+	}
+	fp = fopen(para->foldedfile, "w");
+	if (fp == NULL) {
+		printf("Failed to create folded stack file.\n");
+		return -1;
+	}
+	fclose(fp);
+	fp = fopen(para->healthfile, "w");
+	if (fp == NULL) {
+		printf("Failed to create capture health file.\n");
+		return -1;
+	}
+	fputs("timestamp_ns,alloc_events,free_events,alloc_map_failures,context_map_failures,aggregate_map_failures,stack_trace_failures\n", fp);
+	fclose(fp);
 
 	printf("outfiles in dir: %s.\n", path);
 
 	return 0;
 }
 
-struct statistical g_statistical = {.stack_num = 1};
-static void print_statistical_head(char *outfilename)
+static void write_snapshot(struct stack_node **stackmaps, char *outfilename)
 {
-	FILE *fp = NULL;
-	char buffer[1024]  = {0};
-	memset(buffer, 0x0, sizeof(buffer));
+	struct stack_node *node;
+	struct timespec now;
+	FILE *fp;
 
-	fp = fopen(outfilename,"a+");
-	if(!fp){
-		printf("Failed to open statistical outfile. filename = %s.\n", outfilename);
-		return ;
+	if (!outfilename || !outfilename[0])
+		return;
+	clock_gettime(CLOCK_REALTIME, &now);
+	fp = fopen(outfilename, "a");
+	if (!fp)
+		return;
+	for (node = *stackmaps; node; node = node->hh.next) {
+		fprintf(fp, "%llu,%llu,%s,%llu,%d,%llu,%llu,%llu,%llu\n",
+				(unsigned long long)now.tv_sec * 1000000000ULL + now.tv_nsec,
+				(unsigned long long)node->key.tgid, node->key.comm,
+				(unsigned long long)node->key.family, node->key.stack_id,
+				(unsigned long long)node->memsum,
+				(unsigned long long)node->memtimes,
+				(unsigned long long)node->allocated_bytes,
+				(unsigned long long)node->freed_bytes);
 	}
-	
-	for(int i = 0; i < g_statistical.stack_num; i++)
-	{
-		sprintf(buffer + strlen(buffer), "%d,", g_statistical.stack_id[i]);
-		if(i > 50){
-			fwrite(buffer, 1, strlen(buffer), fp);
-			memset(buffer, 0x0, sizeof(buffer));
-		}
-	}
-	sprintf(buffer + strlen(buffer), "\n");
-	fwrite(buffer, 1, strlen(buffer), fp);
-
 	fclose(fp);
-
-	return ;
 }
 
-static void print_statistical(struct stack_node **stackmaps, char *outfilename)
+static void write_folded_stacks(struct stack_node **stackmaps, const char *outfilename)
 {
-	FILE *fp = NULL;
-	char buffer[1024]  = {0};
-	int index_summry = 0;
-	struct stack_node *tmpnode = NULL;
+	struct stack_node *node;
+	FILE *fp;
 
-	if(outfilename == NULL || strlen(outfilename) == 0){
-		return ;
-	}
+	if (!outfilename || !outfilename[0])
+		return;
+	fp = fopen(outfilename, "w");
+	if (!fp)
+		return;
+	for (node = *stackmaps; node; node = node->hh.next) {
+		stack_trace_t stack = {};
+		struct proc_symbol symbol;
+		char folded[8192] = {};
+		size_t used = 0;
+		int i;
 
-	g_statistical.stack_summry[0] = time(NULL);
-	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next)
-	{
-		if(tmpnode->stack_id < 0 || tmpnode->stack_id >= MAX_CALL_STACKS
-				|| g_statistical.stack_num >= MAX_CALL_STACKS){
+		if (node->key.stack_id < 0
+				|| bpf_map_lookup_elem(g_stack_traces_fd, &node->key.stack_id, stack) != 0)
 			continue;
+		p_symbol_init(&symbol);
+		for (i = PERF_MAX_STACK_DEPTH - 1; i >= 0; i--) {
+			int ret;
+			int written;
+
+			if (!stack[i])
+				continue;
+			ret = cmdparas.trace_kernel ? kernel_symbol_resolve(stack[i], &symbol)
+					: proc_symbol_resolve(stack[i], &symbol);
+			if (ret != 0)
+				continue;
+			written = snprintf(folded + used, sizeof(folded) - used, "%s%s",
+					used ? ";" : "", symbol.name);
+			if (written < 0 || (size_t)written >= sizeof(folded) - used)
+				break;
+			used += written;
 		}
-
-		if(g_statistical.stack_hash[tmpnode->stack_id] == 0){
-			g_statistical.stack_hash[tmpnode->stack_id] = g_statistical.stack_num;
-			index_summry = g_statistical.stack_num;
-			g_statistical.stack_num++;
-		}else{
-			index_summry = g_statistical.stack_hash[tmpnode->stack_id];
-		}
-
-		g_statistical.stack_id[index_summry] = tmpnode->stack_id;
-		g_statistical.stack_summry[index_summry] = tmpnode->memsum;
+		if (used)
+			fprintf(fp, "%s %llu\n", folded, (unsigned long long)node->memsum);
+		p_symbol_uninit(&symbol);
 	}
-
-	if(g_statistical.stack_num <= 1){
-		return ;
-	}
-
-	memset(buffer, 0x0, sizeof(buffer));
-	fp = fopen(outfilename,"a+");
-	if(!fp){
-		printf("Failed to open statistical outfile. filename = %s.\n", outfilename);
-		return ;
-	}
-
-	for(int i = 0; i < g_statistical.stack_num; i++)
-	{
-		sprintf(buffer + strlen(buffer), "%d,", g_statistical.stack_summry[i]);
-		if(i > 50){
-			fwrite(buffer, 1, strlen(buffer), fp);
-			memset(buffer, 0x0, sizeof(buffer));
-		}
-	}
-	sprintf(buffer + strlen(buffer), "\n");
-
-	fwrite(buffer, 1, strlen(buffer), fp);
 	fclose(fp);
-
-	return;
 }
 
-void add_stack_node(struct stack_node **stackmaps, int stack_id, uint64_t memsize) {
+static void write_capture_health(const char *outfilename)
+{
+	struct timespec now;
+	FILE *fp;
+
+	if (!outfilename || !outfilename[0])
+		return;
+	clock_gettime(CLOCK_REALTIME, &now);
+	fp = fopen(outfilename, "a");
+	if (!fp)
+		return;
+	fprintf(fp, "%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+			(unsigned long long)now.tv_sec * 1000000000ULL + now.tv_nsec,
+			(unsigned long long)skel->bss->g_emleak_prog.alloc_events,
+			(unsigned long long)skel->bss->g_emleak_prog.free_events,
+			(unsigned long long)skel->bss->g_emleak_prog.alloc_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.context_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.aggregate_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.stack_trace_failures);
+	fclose(fp);
+}
+
+static void free_stack_nodes(struct stack_node **stackmaps)
+{
+	struct stack_node *node;
+	struct stack_node *tmp;
+
+	HASH_ITER(hh, *stackmaps, node, tmp) {
+		HASH_DEL(*stackmaps, node);
+		free(node);
+	}
+}
+
+static void add_stack_node(struct stack_node **stackmaps,
+		const struct combined_alloc_key_t *key, uint64_t memsize, uint64_t memtimes,
+		uint64_t allocated_bytes, uint64_t freed_bytes) {
     struct stack_node *s;
 
-    HASH_FIND_INT(*stackmaps, &stack_id, s);  /* id already in the hash? */
+	HASH_FIND(hh, *stackmaps, key, sizeof(*key), s);
 	if (s == NULL) {
-      s = (struct stack_node *)malloc(sizeof *s);
-      s->stack_id = stack_id;
-	  s->memtimes = 1;
-	  s->memsum = memsize;
-      HASH_ADD_INT(*stackmaps, stack_id, s);  /* id: name of key field */
-	  return;
+		s = calloc(1, sizeof(*s));
+		if (!s)
+			return;
+		s->key = *key;
+		s->memtimes = memtimes;
+		s->memsum = memsize;
+		s->allocated_bytes = allocated_bytes;
+		s->freed_bytes = freed_bytes;
+		HASH_ADD(hh, *stackmaps, key, sizeof(s->key), s);
+		return;
 	}
 
-	/*update node*/
-    s->memtimes ++;
+	s->memtimes += memtimes;
 	s->memsum += memsize;
+	s->allocated_bytes += allocated_bytes;
+	s->freed_bytes += freed_bytes;
 }
 
 static void print_top_snapshot(struct stack_node **stackmaps,
@@ -746,8 +839,7 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 	uint64_t alloc_delta = 0;
 	uint64_t free_delta = 0;
 	uint64_t mem_total = read_meminfo_kb("MemTotal:");
-	char pid_text[32];
-	const char *command;
+	int display_limit = cmdparas.top_n ? cmdparas.top_n : top_display_limit();
 	int shown = 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -756,7 +848,6 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 		alloc_delta = skel->bss->g_emleak_prog.alloc_events - g_last_alloc_events;
 		free_delta = skel->bss->g_emleak_prog.free_events - g_last_free_events;
 	}
-
 	printf("\033[H\033[2J");
 	print_system_memory_header();
 	printf("emleak: mode=%s, interval=%ds, target=%s\n",
@@ -767,53 +858,54 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 	printf("captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes\n\n",
 			(unsigned long long)total_bytes, (unsigned long long)object_count,
 			g_last_snapshot_ns ? (long long)((int64_t)total_bytes - (int64_t)g_last_total_bytes) : 0LL);
-	if (cmdparas.trace_kernel) {
-		if (cmdparas.pid)
-			snprintf(pid_text, sizeof(pid_text), "%llu",
-				(unsigned long long)cmdparas.pid);
-		else
-			strncpy(pid_text, "ALL", sizeof(pid_text));
-		command = cmdparas.comm_filter ? cmdparas.prog_comm : "kernel allocations";
-	} else {
-		if (skel->bss->g_emleak_prog.prog_pid)
-			snprintf(pid_text, sizeof(pid_text), "%llu",
-				(unsigned long long)skel->bss->g_emleak_prog.prog_pid);
-		else
-			strncpy(pid_text, "wait", sizeof(pid_text));
-		command = cmdparas.comm_filter ? cmdparas.prog_comm : cmdparas.elffile;
+	printf("\033[47;30m    TGID  COMMAND           KIND    OUTSTANDING    ALLOC_TOTAL     FREE_TOTAL    OBJECTS   %%MEM  STACK\033[0m\n");
+	for (node = *stackmaps; node && shown < display_limit; node = node->hh.next) {
+		const char *kind = node->key.family == ALLOC_FAMILY_KERNEL_PAGE ? "page" :
+			node->key.family == ALLOC_FAMILY_KERNEL_SLAB ? "slab" : "user";
+
+		printf("%8llu  %-16.16s  %-6.6s  %13llu  %13llu  %13llu  %9llu  %5.1f  %d\n",
+				(unsigned long long)node->key.tgid, node->key.comm, kind,
+				(unsigned long long)node->memsum,
+				(unsigned long long)node->allocated_bytes,
+				(unsigned long long)node->freed_bytes,
+				(unsigned long long)node->memtimes,
+				mem_total ? node->memsum / 1024.0 / mem_total * 100.0 : 0.0,
+				node->key.stack_id);
+		shown++;
 	}
-	pid_text[sizeof(pid_text) - 1] = '\0';
-	printf(" PID     USER      PR  NI       VIRT       RES       SHR  %%CPU  %%MEM  TIME+ COMMAND\n");
-	printf("%6s  %-8s  %2s  %2s  %9llu  %9lld  %9llu  %5llu  %5.1f  %5llu  %s\n",
-			pid_text, cmdparas.trace_kernel ? "KERNEL" : current_user_name(), "-", "-",
-			(unsigned long long)total_bytes,
-			(long long)(g_last_snapshot_ns
-					? (int64_t)total_bytes - (int64_t)g_last_total_bytes : 0),
-			(unsigned long long)object_count,
-			(unsigned long long)(cmdparas.interval ? alloc_delta / cmdparas.interval : alloc_delta),
-			mem_total ? total_bytes / 1024.0 / mem_total * 100.0 : 0.0,
-			(unsigned long long)(cmdparas.interval ? free_delta / cmdparas.interval : free_delta),
-			command);
 	if (g_last_snapshot_ns) {
-		printf("\nCaptured status: alloc=%llu, free=%llu, outstanding=%llu bytes\n",
+		printf("\nCaptured events: alloc=%llu/s, free=%llu/s, outstanding=%llu bytes\n",
 				(unsigned long long)alloc_delta,
 				(unsigned long long)free_delta,
 				(unsigned long long)total_bytes);
 	}
-	printf("\nTop %d outstanding allocation stacks:\n", cmdparas.top_n);
-	for (node = *stackmaps; node && shown < cmdparas.top_n; node = node->hh.next) {
+	if (skel->bss->g_emleak_prog.alloc_map_failures
+			|| skel->bss->g_emleak_prog.context_map_failures
+			|| skel->bss->g_emleak_prog.aggregate_map_failures
+			|| skel->bss->g_emleak_prog.stack_trace_failures)
+		printf("Capture health: alloc-map=%llu context=%llu aggregate=%llu stack=%llu\n",
+				(unsigned long long)skel->bss->g_emleak_prog.alloc_map_failures,
+				(unsigned long long)skel->bss->g_emleak_prog.context_map_failures,
+				(unsigned long long)skel->bss->g_emleak_prog.aggregate_map_failures,
+				(unsigned long long)skel->bss->g_emleak_prog.stack_trace_failures);
+	if (!cmdparas.show_stacks)
+		goto done;
+	printf("\nTop %d outstanding allocation stacks:\n", display_limit);
+	shown = 0;
+	for (node = *stackmaps; node && shown < display_limit; node = node->hh.next) {
 		stack_trace_t stack = {};
 		struct proc_symbol symbol;
 
 		p_symbol_init(&symbol);
-		if (bpf_map_lookup_elem(g_stack_traces_fd, &node->stack_id, stack) == 0
+		if (node->key.stack_id >= 0
+				&& bpf_map_lookup_elem(g_stack_traces_fd, &node->key.stack_id, stack) == 0
 				&& stack[0]
 				&& (cmdparas.trace_kernel
 						? kernel_symbol_resolve(stack[0], &symbol) == 0
 						: proc_symbol_resolve(stack[0], &symbol) == 0)) {
 			printf("%2d. %llu bytes, %llu objects, stack=%d, %s+0x%lx",
 					shown + 1, (unsigned long long)node->memsum,
-					(unsigned long long)node->memtimes, node->stack_id,
+					(unsigned long long)node->memtimes, node->key.stack_id,
 					symbol.name, symbol.offset);
 			if (cmdparas.trace_kernel && symbol.module[0])
 				printf(" [%s]", symbol.module);
@@ -821,11 +913,13 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 		} else {
 			printf("%2d. %llu bytes, %llu objects, stack=%d\n",
 					shown + 1, (unsigned long long)node->memsum,
-					(unsigned long long)node->memtimes, node->stack_id);
+					(unsigned long long)node->memtimes, node->key.stack_id);
 		}
 		p_symbol_uninit(&symbol);
 		shown++;
 	}
+
+done:
 	fflush(stdout);
 
 	g_last_alloc_events = skel->bss->g_emleak_prog.alloc_events;
@@ -834,50 +928,85 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 	g_last_snapshot_ns = now_ns;
 }
 
-void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
+static void collect_old_allocations(struct stack_node **stackmaps,
+		uint64_t *total_bytes, uint64_t *object_count)
 {
 	struct alloc_key_t prev_key = {}, key = {};
-	__u64 now_ns = 0;
-	struct alloc_info_t alloc_info;
-	struct stack_node *stackmaps = NULL;
+	struct alloc_info_t info;
 	struct timespec now;
+	uint64_t now_ns;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+	while (bpf_map_get_next_key(g_allocs_fd, &prev_key, &key) == 0) {
+		struct combined_alloc_key_t aggregate_key = {};
+
+		if (bpf_map_lookup_elem(g_allocs_fd, &key, &info) == 0
+				&& now_ns >= info.timestamp_ns
+				&& now_ns - info.timestamp_ns >= cmdparas.older_ns) {
+			aggregate_key.tgid = info.tgid;
+			aggregate_key.family = info.family;
+			aggregate_key.stack_id = info.stack_id;
+			memcpy(aggregate_key.comm, info.comm, sizeof(aggregate_key.comm));
+			add_stack_node(stackmaps, &aggregate_key, info.size, 1, info.size, 0);
+			*total_bytes += info.size;
+			(*object_count)++;
+		}
+		prev_key = key;
+	}
+}
+
+void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
+{
+	struct combined_alloc_key_t prev_key = {}, key = {};
+	struct combined_alloc_info_t *values;
+	struct stack_node *stackmaps = NULL;
 	uint64_t total_bytes = 0;
 	uint64_t object_count = 0;
+	int ncpus;
 
 	if (cmdparas.older_ns) {
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
-	}
+		collect_old_allocations(&stackmaps, &total_bytes, &object_count);
+	} else {
+		ncpus = libbpf_num_possible_cpus();
+		if (ncpus <= 0)
+			return;
+		values = calloc(ncpus, sizeof(*values));
+		if (!values)
+			return;
+		while (bpf_map_get_next_key(g_combined_allocs_fd, &prev_key, &key) == 0) {
+		int cpu;
+		int64_t bytes = 0;
+		int64_t objects = 0;
+		uint64_t allocated_bytes = 0;
+		uint64_t freed_bytes = 0;
 
-	while (bpf_map_get_next_key(g_allocs_fd, &prev_key, &key) == 0) 
-	{
-		if (bpf_map_lookup_elem(g_allocs_fd, &key, &alloc_info) != 0) {
+		if (bpf_map_lookup_elem(g_combined_allocs_fd, &key, values) != 0) {
 			prev_key = key;
 			continue;
 		}
-
-		if (cmdparas.older_ns && now_ns > alloc_info.timestamp_ns
-				&& now_ns - alloc_info.timestamp_ns < cmdparas.older_ns) {
-			prev_key = key;
-			continue;
+		for (cpu = 0; cpu < ncpus; cpu++) {
+			bytes += values[cpu].total_size;
+			objects += values[cpu].number_of_allocs;
+			allocated_bytes += values[cpu].allocated_bytes;
+			freed_bytes += values[cpu].freed_bytes;
 		}
-		total_bytes += alloc_info.size;
-		object_count++;
-
-		if(alloc_info.stack_id < 0){
-			prev_key = key;
-			continue;
+		if (bytes > 0 && objects > 0) {
+			add_stack_node(&stackmaps, &key, bytes, objects,
+					allocated_bytes, freed_bytes);
+			total_bytes += bytes;
+			object_count += objects;
 		}
-
-		add_stack_node(&stackmaps, alloc_info.stack_id, alloc_info.size);
-		prev_key = key;
+			prev_key = key;
+		}
+		free(values);
 	}
 	
 	/*Sort by memory size*/
 	HASH_SORT(stackmaps, cmp_by_memsum);
 	if (cmdparas.mode == EMLEAK_MODE_TOP) {
 		print_top_snapshot(&stackmaps, total_bytes, object_count);
-		HASH_CLEAR(hh, stackmaps);
+		free_stack_nodes(&stackmaps);
 		return;
 	}
 
@@ -887,13 +1016,11 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	if (summaryfile && strlen(summaryfile)) {
 		print_summary(&stackmaps, summaryfile);
 	}
-	print_statistical(&stackmaps, statisticalfile);
-	if(islastprint)
-	{
-		print_statistical_head(statisticalfile);
-	}
-
-	HASH_CLEAR(hh, stackmaps);
+	write_snapshot(&stackmaps, statisticalfile);
+	write_capture_health(cmdparas.healthfile);
+	if (islastprint)
+		write_folded_stacks(&stackmaps, cmdparas.foldedfile);
+	free_stack_nodes(&stackmaps);
 }
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -985,13 +1112,19 @@ set_start_time:
 static void old_environment_clean(void)
 {
 	struct alloc_ctx_key_t size_prev_key = {}, size_key = {};
+	struct alloc_ctx_key_t realloc_prev_key = {}, realloc_key = {};
 	struct alloc_key_t alloc_prev_key = {}, alloc_key = {};
 	__u64 prev_key = 0, key = 0;
+	struct combined_alloc_key_t combined_prev_key = {}, combined_key = {};
 	__u32 prev_key1 = 0, key1 = 0;
 
 	while (bpf_map_get_next_key(g_sizes_fd, &size_prev_key, &size_key) == 0){
 		bpf_map_delete_elem(g_sizes_fd, &size_key);
 		size_prev_key = size_key;
+	}
+	while (bpf_map_get_next_key(g_realloc_ptrs_fd, &realloc_prev_key, &realloc_key) == 0){
+		bpf_map_delete_elem(g_realloc_ptrs_fd, &realloc_key);
+		realloc_prev_key = realloc_key;
 	}
 
 	while (bpf_map_get_next_key(g_allocs_fd, &alloc_prev_key, &alloc_key) == 0){
@@ -1009,9 +1142,10 @@ static void old_environment_clean(void)
 		bpf_map_delete_elem(g_stack_traces_fd, &key1);
 	}
 
-	prev_key = 0;
-	while (bpf_map_get_next_key(g_combined_allocs_fd, &prev_key, &key) == 0){
-		bpf_map_delete_elem(g_combined_allocs_fd, &key);
+	while (bpf_map_get_next_key(g_combined_allocs_fd, &combined_prev_key,
+						&combined_key) == 0){
+		bpf_map_delete_elem(g_combined_allocs_fd, &combined_key);
+		combined_prev_key = combined_key;
 	}
 
 	return ;
@@ -1021,9 +1155,7 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 {
 	const struct event_t *msg = data;
 
-	pthread_mutex_lock(&g_perf_event_mutex);
 	if(skel->bss->g_emleak_prog.prog_state == PROG_IDEL_STATE){
-		pthread_mutex_unlock(&g_perf_event_mutex);
 		return ;
 	}
 	
@@ -1053,11 +1185,18 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		}else{
 			printf("Loaded failed, pid = %d!\n", pid);
 		}
+		if (attach_user_allocator(skel, pid) != 0)
+			fprintf(stderr, "Failed to attach libc allocation probes for pid %d\n", pid);
+		if (cmdparas.mfuncname[0] || cmdparas.ffuncname[0]) {
+			char executable[MAXFILELEN] = {};
+
+			if (get_executable_path_by_pid(pid, executable, sizeof(executable)) == 0)
+				user_defined_func_attach(skel, executable, cmdparas.mfuncname,
+						cmdparas.ffuncname, pid);
+		}
 		if (cmdparas.mode == EMLEAK_MODE_RECORD)
 			outfiles_init(pid, &cmdparas);
 	}
-
-	pthread_mutex_unlock(&g_perf_event_mutex);
 
 	return ;
 }
@@ -1067,63 +1206,9 @@ static void handle_lost_perf_events(void *ctx, int cpu, __u64 lost_cnt)
 	printf("lost %llu events on CPU #%d\n", lost_cnt, cpu);
 }
 
-void* print_thread(void* arg)
-{
-	int ret = 0;
-	int interval = *(int*)arg;
-	int epoll_fd = 0;
-	struct epoll_event events[1];
-
-	epoll_fd = epoll_create(1); 
-    if (epoll_fd < 0) {
-        printf("epoll_create error, Error:[%d:%s]", errno, strerror(errno));
-        return NULL;
-    }
-
-	struct epoll_event event;
-	memset(&event, 0, sizeof(event));
-    event.data.fd = socket(AF_INET, SOCK_STREAM, 0);
-	if(event.data.fd <= 0){
-		printf("inviled socket = %d\n", event.data.fd);
-		return NULL;
-	}
-    event.events = EPOLLIN | EPOLLET;
-	ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event.data.fd, &event);
-    if(ret < 0) {
-        printf("epoll_ctl Add fd:%d error, Error:[%d:%s]", event.data.fd, errno, strerror(errno));
-        return NULL;
-    }
-
-	int times_index = 0;
-	while(1){
-		ret = epoll_wait(epoll_fd, events, sizeof(events)/sizeof(struct epoll_event), 1000);
-		times_index++;
-
-		if(g_signal){
-			close(event.data.fd);
-			return NULL;
-		}
-
-		if(times_index < interval){
-			continue;
-		}
-
-		if(skel->bss->g_emleak_prog.prog_state == PROG_START_STATE)
-		{
-			print_outstanding(NULL, NULL, cmdparas.statisticalfile, 0);
-		}
-		times_index = 0;
-	}
-}
-
 void emleak_signal(int sig)
 {
-	printf("start process emleak_signal. sig = %d.\n", sig);
-
-	/*Notification print thread*/
 	g_signal = sig;
-
-	return ;
 }
 
 ssize_t get_symbol_uprobe_offset(char *elf_pwd, char *symbol_name)
@@ -1135,37 +1220,141 @@ ssize_t get_symbol_uprobe_offset(char *elf_pwd, char *symbol_name)
 	memset(&info, 0x00, sizeof(info));
 
 	if(elf_pwd == NULL || symbol_name == NULL){
-		return 0;
+		return -1;
 	}
 	if(strlen(elf_pwd) == 0 || strlen(symbol_name) == 0){
-		return 0;
+		return -1;
 	}
 
 	/*open the elf file.*/
 	handle = dlopen(elf_pwd, RTLD_NOW); 
     if (!handle) {
         fprintf(stderr, "Error: %s\n", dlerror());
-        return 0;
+		return -1;
     }
 
 	func_ptr = dlsym(handle, symbol_name);
     if (!func_ptr) {
         fprintf(stderr, "Error: %s\n", dlerror());
-        return 0;
+		dlclose(handle);
+		return -1;
     }
 
-	if (!dladdr(func_ptr, &info)) {
+    if (!dladdr(func_ptr, &info)) {
         fprintf(stderr, "Error: %s\n", dlerror());
-        return 0;
+		dlclose(handle);
+		return -1;
     }
 
 	dlclose(handle);
 
-    return func_ptr - info.dli_fbase;
+	return (char *)func_ptr - (char *)info.dli_fbase;
+}
+
+static int get_libc_path_by_pid(pid_t pid, char *path, size_t path_size)
+{
+	char maps_path[64];
+	char line[2048];
+	FILE *maps;
+
+	if (snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid)
+			>= (int)sizeof(maps_path))
+		return -1;
+	maps = fopen(maps_path, "r");
+	if (!maps)
+		return -1;
+	while (fgets(line, sizeof(line), maps)) {
+		char *file = strchr(line, '/');
+		char *deleted;
+
+		if (!file || (!strstr(file, "/libc.so") && !strstr(file, "/libc-")))
+			continue;
+		file[strcspn(file, "\n")] = '\0';
+		deleted = strstr(file, " (deleted)");
+		if (deleted)
+			*deleted = '\0';
+		if (snprintf(path, path_size, "/proc/%d/root%s", pid, file)
+				>= (int)path_size) {
+			fclose(maps);
+			return -1;
+		}
+		fclose(maps);
+		return 0;
+	}
+	fclose(maps);
+	return -1;
+}
+
+static int attach_libc_probe(struct bpf_program *prog, struct bpf_link **link,
+		const char *libc_path, pid_t pid, const char *symbol, bool retprobe,
+		bool required)
+{
+	ssize_t offset = get_symbol_uprobe_offset((char *)libc_path, (char *)symbol);
+
+	if (offset < 0)
+		return required ? -1 : 0;
+	*link = bpf_program__attach_uprobe(prog, retprobe, pid, libc_path, offset);
+	return *link ? 0 : (required ? -1 : 0);
+}
+
+static void detach_user_allocator(struct emleak_bpf *skeleton)
+{
+	#define DETACH_LIBC(member) do { \
+		if (skeleton->links.member) { \
+			bpf_link__destroy(skeleton->links.member); \
+			skeleton->links.member = NULL; \
+		} \
+	} while (0)
+	DETACH_LIBC(malloc_enter); DETACH_LIBC(malloc_exit); DETACH_LIBC(free_enter);
+	DETACH_LIBC(calloc_enter); DETACH_LIBC(calloc_exit); DETACH_LIBC(realloc_enter);
+	DETACH_LIBC(realloc_exit); DETACH_LIBC(mmap_enter); DETACH_LIBC(mmap_exit);
+	DETACH_LIBC(munmap_enter); DETACH_LIBC(posix_memalign_enter);
+	DETACH_LIBC(posix_memalign_exit); DETACH_LIBC(aligned_alloc_enter);
+	DETACH_LIBC(aligned_alloc_exit); DETACH_LIBC(valloc_enter); DETACH_LIBC(valloc_exit);
+	DETACH_LIBC(memalign_enter); DETACH_LIBC(memalign_exit); DETACH_LIBC(pvalloc_enter);
+	DETACH_LIBC(pvalloc_exit);
+	#undef DETACH_LIBC
+}
+
+static int attach_user_allocator(struct emleak_bpf *skeleton, pid_t pid)
+{
+	char libc_path[MAXFILELEN];
+	int err = 0;
+
+	if (get_libc_path_by_pid(pid, libc_path, sizeof(libc_path)) != 0) {
+		fprintf(stderr, "Failed to find libc for pid %d\n", pid);
+		return -1;
+	}
+	detach_user_allocator(skeleton);
+	#define ATTACH_LIBC(member, symbol, ret, required) \
+		do { err = attach_libc_probe(skeleton->progs.member, &skeleton->links.member, \
+				libc_path, pid, symbol, ret, required); if (err) return err; } while (0)
+	ATTACH_LIBC(malloc_enter, "malloc", false, true);
+	ATTACH_LIBC(malloc_exit, "malloc", true, true);
+	ATTACH_LIBC(free_enter, "free", false, true);
+	ATTACH_LIBC(calloc_enter, "calloc", false, true);
+	ATTACH_LIBC(calloc_exit, "calloc", true, true);
+	ATTACH_LIBC(realloc_enter, "realloc", false, true);
+	ATTACH_LIBC(realloc_exit, "realloc", true, true);
+	ATTACH_LIBC(mmap_enter, "mmap", false, true);
+	ATTACH_LIBC(mmap_exit, "mmap", true, true);
+	ATTACH_LIBC(munmap_enter, "munmap", false, true);
+	ATTACH_LIBC(posix_memalign_enter, "posix_memalign", false, false);
+	ATTACH_LIBC(posix_memalign_exit, "posix_memalign", true, false);
+	ATTACH_LIBC(aligned_alloc_enter, "aligned_alloc", false, false);
+	ATTACH_LIBC(aligned_alloc_exit, "aligned_alloc", true, false);
+	ATTACH_LIBC(valloc_enter, "valloc", false, false);
+	ATTACH_LIBC(valloc_exit, "valloc", true, false);
+	ATTACH_LIBC(memalign_enter, "memalign", false, false);
+	ATTACH_LIBC(memalign_exit, "memalign", true, false);
+	ATTACH_LIBC(pvalloc_enter, "pvalloc", false, false);
+	ATTACH_LIBC(pvalloc_exit, "pvalloc", true, false);
+	#undef ATTACH_LIBC
+	return 0;
 }
 
 int user_defined_func_attach(struct emleak_bpf *skel,
-				char *elf_pwd, char *malloc_func, char *free_func)
+				char *elf_pwd, char *malloc_func, char *free_func, pid_t pid)
 {
 	long m_offset, f_offset;
 
@@ -1177,16 +1366,16 @@ int user_defined_func_attach(struct emleak_bpf *skel,
 	f_offset = get_symbol_uprobe_offset(elf_pwd, free_func);
 
 	/*touch malloc*/
-	if(m_offset != 0){
+	if(m_offset > 0){
 		skel->links.malloc_add = bpf_program__attach_uprobe(skel->progs.malloc_add,
-							    		false, 0, elf_pwd, m_offset);
+										false, pid, elf_pwd, m_offset);
 		if (!skel->links.malloc_add) {
 			//fprintf(stderr, "Failed to attach uprobe malloc: %d\n", err);
 			return -1;
 		}
 
 		skel->links.retmalloc_add = bpf_program__attach_uprobe(skel->progs.retmalloc_add,
-									true, 0, elf_pwd, m_offset);
+										true, pid, elf_pwd, m_offset);
 		if (!skel->links.retmalloc_add) {
 			//fprintf(stderr, "Failed to attach upretrobe malloc: %d\n", err);
 			return -1;
@@ -1194,9 +1383,9 @@ int user_defined_func_attach(struct emleak_bpf *skel,
 	}
 
 	/*touch free*/
-	if(f_offset != 0){
+	if(f_offset > 0){
 		skel->links.free_add = bpf_program__attach_uprobe(skel->progs.free_add,
-							    		false, 0, elf_pwd, f_offset);
+										false, pid, elf_pwd, f_offset);
 		if (!skel->links.free_add) {
 			//fprintf(stderr, "Failed to attach uprobe free: %d\n", err);
 			return -1;
@@ -1212,6 +1401,7 @@ int main(int argc, char **argv)
 	int ret = 0;
 	struct perf_buffer *pb = NULL;
 	time_t deadline = 0;
+	uint64_t next_snapshot_ns = 0;
 
 	if (argc > 1 && strcmp(argv[1], "top") == 0) {
 		cmdparas.mode = EMLEAK_MODE_TOP;
@@ -1222,8 +1412,6 @@ int main(int argc, char **argv)
 		argv++;
 		argc--;
 	}
-
-	pthread_mutex_init(&g_perf_event_mutex, NULL);
 
 	ret = cmd_opts_analytic(argc, argv, &cmdparas);
 	if(ret < 0){
@@ -1256,8 +1444,14 @@ int main(int argc, char **argv)
 	}
 
 	if (!cmdparas.trace_kernel) {
+		if (cmdparas.pid && attach_user_allocator(skel, cmdparas.pid) != 0) {
+			fprintf(stderr, "Failed to attach libc allocation probes for pid %lu\n",
+					cmdparas.pid);
+			goto cleanup;
+		}
 		err = user_defined_func_attach(skel,
-							cmdparas.elffile, cmdparas.mfuncname, cmdparas.ffuncname);
+							cmdparas.elffile, cmdparas.mfuncname, cmdparas.ffuncname,
+							(pid_t)cmdparas.pid);
 		if (err) {
 			fprintf(stderr, "Failed to attach customized allocation functions\n");
 			goto cleanup;
@@ -1265,6 +1459,7 @@ int main(int argc, char **argv)
 	}
 
 	g_sizes_fd = bpf_map__fd(skel->maps.sizes); 
+	g_realloc_ptrs_fd = bpf_map__fd(skel->maps.realloc_ptrs);
 	g_allocs_fd = bpf_map__fd(skel->maps.allocs);
 	g_memptrs_fd = bpf_map__fd(skel->maps.memptrs);
 	g_stack_traces_fd = bpf_map__fd(skel->maps.stack_traces);
@@ -1287,17 +1482,16 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	pthread_t print_tid;
-	if(cmdparas.interval){
-		if (pthread_create(&print_tid, NULL, (void*)print_thread, (void*)&cmdparas.interval) != 0) {
-			printf("print pthread create error.");
-			exit(EXIT_FAILURE);
-		}
-	}
-
 	signal(SIGINT, emleak_signal);
+	signal(SIGTERM, emleak_signal);
 	if (cmdparas.duration)
 		deadline = time(NULL) + cmdparas.duration;
+	if (cmdparas.interval) {
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		next_snapshot_ns = ((uint64_t)now.tv_sec + cmdparas.interval) * 1000000000ULL;
+	}
 
 	printf("Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
 	       "to see output of the BPF programs.\n");
@@ -1319,6 +1513,22 @@ int main(int argc, char **argv)
 		if (err < 0 && err != -EINTR) {
 			printf("error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
+		}
+		if (next_snapshot_ns) {
+			struct timespec now;
+			uint64_t now_ns;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			now_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+			if (now_ns >= next_snapshot_ns) {
+				if (skel->bss->g_emleak_prog.prog_state == PROG_START_STATE) {
+					if (cmdparas.mode == EMLEAK_MODE_RECORD)
+						print_outstanding(NULL, NULL, cmdparas.statisticalfile, 0);
+					else
+						print_outstanding(NULL, NULL, NULL, 0);
+				}
+				next_snapshot_ns = now_ns + (uint64_t)cmdparas.interval * 1000000000ULL;
+			}
 		}
 		if (g_signal) {
 			struct event_t new_msg;

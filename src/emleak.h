@@ -10,6 +10,8 @@
 #define STACK_OUTFILE_NAME "mleakstacks.txt"
 #define SUMMARY_OUTFILE_NAME "mleaksummary.csv"
 #define STATICS_OUTFILE_NAME "mleakstatics.csv"
+#define FOLDED_OUTFILE_NAME "mleak.folded"
+#define HEALTH_OUTFILE_NAME "mleakhealth.csv"
 
 enum emleak_mode_e {
     EMLEAK_MODE_RECORD = 0,
@@ -22,7 +24,9 @@ struct emleakpara{
     int interval;                          /**< 统计周期/单位s*/
     char stackfile[MAXFILELEN];            /**< 调动栈文件*/     
     char summaryfile[MAXFILELEN];          /**< 摘要信息文件*/   
-    char statisticalfile[MAXFILELEN];      /**< 详细统计文件*/
+	char statisticalfile[MAXFILELEN];      /**< 详细统计文件*/
+	char foldedfile[MAXFILELEN];           /**< FlameGraph folded stacks */
+	char healthfile[MAXFILELEN];           /**< capture health counters */
     char elffile[MAXFILELEN];              /**< 可执行文件的路径或者库的路径*/
     char mfuncname[MAXFILELEN];            /**< 申请内存的API的名字*/
     char ffuncname[MAXFILELEN];            /**< 释放内存的API名字*/
@@ -36,22 +40,18 @@ struct emleakpara{
     uint64_t max_size;                     /**< 最大分配大小*/
     uint64_t older_ns;                     /**< 只保留超过该年龄的对象*/
     uint64_t duration;                     /**< 自动停止时间，单位秒*/
-    int top_n;                              /**< 实时模式显示栈数量*/
+	int top_n;                              /**< 实时模式显示栈数量*/
+	int show_stacks;                        /**< 实时模式显示调用栈详情*/
     enum emleak_mode_e mode;               /**< 运行模式*/
 };
 
 struct stack_node {
-    int stack_id;                    /* key */
-    uint64_t memtimes;               /*申请的总次数*/
-    uint64_t memsum;                 /*call stak memleak的总大小*/
+	    struct combined_alloc_key_t key; /* owner + allocation stack */
+	    uint64_t memtimes;               /*申请的总次数*/
+	    uint64_t memsum;                 /*call stak memleak的总大小*/
+	    uint64_t allocated_bytes;        /*累计申请字节*/
+	    uint64_t freed_bytes;            /*累计释放字节*/
     UT_hash_handle hh;               /* makes this structure hashable */
-};
-
-struct statistical{
-	int stack_hash[MAX_CALL_STACKS];
-	int stack_num;
-	int stack_id[MAX_CALL_STACKS];
-	int stack_summry[MAX_CALL_STACKS];
 };
 
 #endif
