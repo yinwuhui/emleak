@@ -70,6 +70,8 @@ struct prog_infor_t {
         u64 min_size;                           /**< 最小分配大小*/
         u64 max_size;                           /**< 最大分配大小，0表示不限制*/
         u64 page_size;                           /**< 系统页大小*/
+        u64 alloc_events;                        /**< 已记录的分配事件数*/
+        u64 free_events;                         /**< 已匹配的释放事件数*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/

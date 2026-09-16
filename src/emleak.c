@@ -41,8 +41,14 @@ do{	\
 }while(0)\
 
 struct emleak_bpf *skel;
-struct emleakpara cmdparas = 
-		{ 0, "a.out", 10, STACK_OUTFILE_NAME, SUMMARY_OUTFILE_NAME, STATICS_OUTFILE_NAME};
+struct emleakpara cmdparas = {
+	.pid = 0,
+	.prog_comm = "a.out",
+	.interval = 10,
+	.sample_rate = 1,
+	.top_n = 10,
+	.mode = EMLEAK_MODE_RECORD,
+};
 
 int g_exiting = 0;
 volatile int g_signal = 0;
@@ -52,6 +58,10 @@ static int g_allocs_fd;
 static int g_memptrs_fd;
 static int g_stack_traces_fd;
 static int g_combined_allocs_fd;
+static uint64_t g_last_alloc_events;
+static uint64_t g_last_free_events;
+static uint64_t g_last_total_bytes;
+static uint64_t g_last_snapshot_ns;
 
 pthread_mutex_t g_perf_event_mutex;  /*Avoid  kernel event and user sigfun printing at the same time*/
 
@@ -71,6 +81,8 @@ static const char *__doc__ =
 "    --min-size BYTES only trace allocations at least this size \n"
 "    --max-size BYTES only trace allocations at most this size \n"
 "    --older MS       report only allocations older than MS milliseconds \n"
+"    --top N          show N stacks in top mode (default 10) \n"
+"    --duration SEC   stop record mode after SEC seconds \n"
 "    -m    set you customized malloc function. ex(-m my_malloc) \n"
 "    -f    set you customized free function. ex(-m my_free) \n";
 
@@ -86,6 +98,8 @@ static const struct option long_options[] = {
 	{ "min-size", required_argument, NULL, 1003 },
 	{ "max-size", required_argument, NULL, 1004 },
 	{ "older", required_argument, NULL, 1005 },
+	{ "top", required_argument, NULL, 1006 },
+	{ "duration", required_argument, NULL, 1007 },
 	{ "malloc", required_argument, NULL, 'm' },
 	{ "free", required_argument, NULL, 'f' },
 	{}
@@ -324,6 +338,22 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 			paras->older_ns = older_ms * 1000000ULL;
 			break;
 		}
+		case 1006: {
+			uint64_t top_n;
+
+			if (parse_u64_option(optarg, &top_n) != 0 || top_n == 0 || top_n > 1000) {
+				error = true;
+				goto err_out;
+			}
+			paras->top_n = top_n;
+			break;
+		}
+		case 1007:
+			if (parse_u64_option(optarg, &paras->duration) != 0) {
+				error = true;
+				goto err_out;
+			}
+			break;
 		case 'm':
 			if(strlen(optarg) > MAXFILELEN){
 				error = true;
@@ -411,7 +441,8 @@ static void print_stacks(struct stack_node **stackmaps, char *outfilename)
 			continue;
 		} 
 		
-		PRINT_STACK(fp, "%d bytes allocated at callstack id %d: \n", tmpnode->memsum, tmpnode->stack_id);
+		PRINT_STACK(fp, "%llu bytes allocated at callstack id %d: \n",
+				(unsigned long long)tmpnode->memsum, tmpnode->stack_id);
 
 		for (int i = 0; i < PERF_MAX_STACK_DEPTH ; i++)
 		{
@@ -462,8 +493,10 @@ static void print_summary(struct stack_node **stackmaps, char *outfilename)
 	}
 
 	for (tmpnode = *stackmaps; tmpnode != NULL; tmpnode = tmpnode->hh.next){
-		snprintf(buffer, MAX_BUFF_LEN, "%d, %d, %d \n", 
-					tmpnode->stack_id, tmpnode->memsum, tmpnode->memtimes);
+		snprintf(buffer, MAX_BUFF_LEN, "%d, %llu, %llu \n",
+						tmpnode->stack_id,
+						(unsigned long long)tmpnode->memsum,
+						(unsigned long long)tmpnode->memtimes);
 		fwrite(buffer, 1, strlen(buffer), fp);
 	}
 
@@ -622,21 +655,85 @@ static void print_statistical(struct stack_node **stackmaps, char *outfilename)
 	return;
 }
 
-void add_stack_node(struct stack_node **stackmaps, int stack_id, int memsize) {
+void add_stack_node(struct stack_node **stackmaps, int stack_id, uint64_t memsize) {
     struct stack_node *s;
 
     HASH_FIND_INT(*stackmaps, &stack_id, s);  /* id already in the hash? */
-    if (s == NULL) {
+	if (s == NULL) {
       s = (struct stack_node *)malloc(sizeof *s);
       s->stack_id = stack_id;
-	  s->memtimes = 1; 
+	  s->memtimes = 1;
 	  s->memsum = memsize;
       HASH_ADD_INT(*stackmaps, stack_id, s);  /* id: name of key field */
-    }
+	  return;
+	}
 
 	/*update node*/
     s->memtimes ++;
 	s->memsum += memsize;
+}
+
+static void print_top_snapshot(struct stack_node **stackmaps,
+		uint64_t total_bytes, uint64_t object_count)
+{
+	struct stack_node *node;
+	struct timespec now;
+	uint64_t now_ns;
+	uint64_t alloc_delta = 0;
+	uint64_t free_delta = 0;
+	int shown = 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+	if (g_last_snapshot_ns) {
+		alloc_delta = skel->bss->g_emleak_prog.alloc_events - g_last_alloc_events;
+		free_delta = skel->bss->g_emleak_prog.free_events - g_last_free_events;
+	}
+
+	printf("\033[H\033[2J");
+	printf("emleak top | mode=%s | interval=%ds\n",
+			cmdparas.trace_kernel ? "kernel" : "user", cmdparas.interval);
+	printf("outstanding: %llu bytes, %llu objects | alloc/s: %llu | free/s: %llu\n",
+			(unsigned long long)total_bytes,
+			(unsigned long long)object_count,
+			(unsigned long long)(cmdparas.interval ? alloc_delta / cmdparas.interval : alloc_delta),
+			(unsigned long long)(cmdparas.interval ? free_delta / cmdparas.interval : free_delta));
+	if (g_last_snapshot_ns) {
+		int64_t growth = (int64_t)total_bytes - (int64_t)g_last_total_bytes;
+		printf("period growth: %+lld bytes\n", (long long)growth);
+	}
+	printf("\nTop %d outstanding allocation stacks:\n", cmdparas.top_n);
+	for (node = *stackmaps; node && shown < cmdparas.top_n; node = node->hh.next) {
+		stack_trace_t stack = {};
+		struct proc_symbol symbol;
+
+		p_symbol_init(&symbol);
+		if (bpf_map_lookup_elem(g_stack_traces_fd, &node->stack_id, stack) == 0
+				&& stack[0]
+				&& (cmdparas.trace_kernel
+						? kernel_symbol_resolve(stack[0], &symbol) == 0
+						: proc_symbol_resolve(stack[0], &symbol) == 0)) {
+			printf("%2d. %llu bytes, %llu objects, stack=%d, %s+0x%lx",
+					shown + 1, (unsigned long long)node->memsum,
+					(unsigned long long)node->memtimes, node->stack_id,
+					symbol.name, symbol.offset);
+			if (cmdparas.trace_kernel && symbol.module[0])
+				printf(" [%s]", symbol.module);
+			printf("\n");
+		} else {
+			printf("%2d. %llu bytes, %llu objects, stack=%d\n",
+					shown + 1, (unsigned long long)node->memsum,
+					(unsigned long long)node->memtimes, node->stack_id);
+		}
+		p_symbol_uninit(&symbol);
+		shown++;
+	}
+	fflush(stdout);
+
+	g_last_alloc_events = skel->bss->g_emleak_prog.alloc_events;
+	g_last_free_events = skel->bss->g_emleak_prog.free_events;
+	g_last_total_bytes = total_bytes;
+	g_last_snapshot_ns = now_ns;
 }
 
 void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfile, int islastprint)
@@ -646,6 +743,8 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	struct alloc_info_t alloc_info;
 	struct stack_node *stackmaps = NULL;
 	struct timespec now;
+	uint64_t total_bytes = 0;
+	uint64_t object_count = 0;
 
 	if (cmdparas.older_ns) {
 		clock_gettime(CLOCK_MONOTONIC, &now);
@@ -664,6 +763,8 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 			prev_key = key;
 			continue;
 		}
+		total_bytes += alloc_info.size;
+		object_count++;
 
 		if(alloc_info.stack_id < 0){
 			prev_key = key;
@@ -676,6 +777,11 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	
 	/*Sort by memory size*/
 	HASH_SORT(stackmaps, cmp_by_memsum);
+	if (cmdparas.mode == EMLEAK_MODE_TOP) {
+		print_top_snapshot(&stackmaps, total_bytes, object_count);
+		HASH_CLEAR(hh, stackmaps);
+		return;
+	}
 
 	if (stacksfile && strlen(stacksfile)) {
 		print_stacks(&stackmaps, stacksfile);
@@ -738,7 +844,8 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 		skel->bss->g_emleak_prog.prog_pid = 0;
 		skel->bss->g_emleak_prog.prog_state = PROG_START_STATE;
 		kernel_syms_load();
-		outfiles_init(0, paras);
+		if (paras->mode == EMLEAK_MODE_RECORD)
+			outfiles_init(0, paras);
 		goto set_start_time;
 	}
 
@@ -756,7 +863,8 @@ static void bpf_para_load(struct emleak_bpf *skel, struct emleakpara *paras)
 			printf("Loaded failed, pid = %ld!\n", paras->pid);
 		}
 
-		outfiles_init(paras->pid, paras);
+		if (paras->mode == EMLEAK_MODE_RECORD)
+			outfiles_init(paras->pid, paras);
 	}
 
 	if(paras->pid != 0){
@@ -824,7 +932,12 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 	if(msg->old_state == PROG_START_STATE 
 	   	&& msg->new_state == PROG_END_STATE)
 	{
-		print_outstanding(cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile, 1);
+		if (cmdparas.mode == EMLEAK_MODE_RECORD) {
+			print_outstanding(cmdparas.stackfile, cmdparas.summaryfile,
+					cmdparas.statisticalfile, 1);
+		} else {
+			print_outstanding(NULL, NULL, NULL, 0);
+		}
 
 		old_environment_clean();
 		skel->bss->g_emleak_prog.prog_state = PROG_IDEL_STATE;
@@ -842,7 +955,8 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		}else{
 			printf("Loaded failed, pid = %d!\n", pid);
 		}
-		outfiles_init(pid, &cmdparas);
+		if (cmdparas.mode == EMLEAK_MODE_RECORD)
+			outfiles_init(pid, &cmdparas);
 	}
 
 	pthread_mutex_unlock(&g_perf_event_mutex);
@@ -999,6 +1113,17 @@ int main(int argc, char **argv)
 	int err;
 	int ret = 0;
 	struct perf_buffer *pb = NULL;
+	time_t deadline = 0;
+
+	if (argc > 1 && strcmp(argv[1], "top") == 0) {
+		cmdparas.mode = EMLEAK_MODE_TOP;
+		argv++;
+		argc--;
+	} else if (argc > 1 && strcmp(argv[1], "record") == 0) {
+		cmdparas.mode = EMLEAK_MODE_RECORD;
+		argv++;
+		argc--;
+	}
 
 	pthread_mutex_init(&g_perf_event_mutex, NULL);
 
@@ -1073,11 +1198,25 @@ int main(int argc, char **argv)
 	}
 
 	signal(SIGINT, emleak_signal);
+	if (cmdparas.duration)
+		deadline = time(NULL) + cmdparas.duration;
 
 	printf("Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
 	       "to see output of the BPF programs.\n");
 
 	while(!g_exiting) {
+		if (deadline && time(NULL) >= deadline) {
+			struct event_t new_msg;
+
+			g_signal = SIGTERM;
+			new_msg.pid = skel->bss->g_emleak_prog.prog_pid;
+			new_msg.msg_type = 0;
+			new_msg.old_state = skel->bss->g_emleak_prog.prog_state;
+			new_msg.new_state = PROG_END_STATE;
+			handle_perf_event(NULL, 0, &new_msg, sizeof(new_msg));
+			g_exiting = 1;
+			continue;
+		}
 		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
 		if (err < 0 && err != -EINTR) {
 			printf("error polling perf buffer: %s\n", strerror(-err));

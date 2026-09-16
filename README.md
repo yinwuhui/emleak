@@ -40,6 +40,22 @@ eBPF `Uprobe`/`Kprobe`实现用户空间/内核空间的接口捕获，无需改
 *   系统linux kernel版本必须高于4.18。
 *   开启BTF [BPF Type Format (BTF)](https://www.kernel.org/doc/html/latest/bpf/btf.html) 支持。 (可选, 2022-04-17)
 
+## 运行模式
+
+实时查看内存增长情况：
+
+```bash
+sudo ./emleak top -k -i 1 --top 10
+```
+
+只采集并导出数据，不显示实时报告：
+
+```bash
+sudo ./emleak record -k -i 1 --duration 60
+```
+
+`top` 模式显示当前未释放内存、对象数、分配/释放速率、周期增长量和 Top N 调用栈；`record` 模式沿用现有输出目录和 CSV/栈文件格式。
+
 ## 命令参数
 
 > **Note**
@@ -63,6 +79,8 @@ OPTS:
     --min-size BYTES  trace allocations at least this size
     --max-size BYTES  trace allocations at most this size
     --older MS        report only allocations older than MS milliseconds
+    --top N            show N stacks in top mode
+    --duration SEC     stop record mode after SEC seconds
 
 ./emleak -p 12356
 #指定进程pid跟踪，默认10s记录一次内存信息到文件.

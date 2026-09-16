@@ -201,6 +201,7 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u64 family) 
             update_statistics_del(old_info->stack_id, old_info->size);
         bpf_map_update_elem(&allocs, &alloc_key, &info, BPF_ANY);
         update_statistics_add(info.stack_id, info.size);
+        __sync_fetch_and_add(&g_emleak_prog.alloc_events, 1);
     }
 
     if (SHOULD_PRINT) {
@@ -236,6 +237,7 @@ static inline int gen_free_enter(struct pt_regs *ctx, void *address, u64 family)
     bpf_map_delete_elem(&allocs, &key);
 
     update_statistics_del(info->stack_id, info->size);
+    __sync_fetch_and_add(&g_emleak_prog.free_events, 1);
 
     if (SHOULD_PRINT) {
         char free_fmt[] = "free entered, address = %lx, size = %lu\\n";

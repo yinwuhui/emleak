@@ -11,6 +11,11 @@
 #define SUMMARY_OUTFILE_NAME "mleaksummary.csv"
 #define STATICS_OUTFILE_NAME "mleakstatics.csv"
 
+enum emleak_mode_e {
+    EMLEAK_MODE_RECORD = 0,
+    EMLEAK_MODE_TOP = 1,
+};
+
 struct emleakpara{
     unsigned long pid;                     /**< 进程 pid*/
     char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
@@ -30,12 +35,15 @@ struct emleakpara{
     uint64_t min_size;                     /**< 最小分配大小*/
     uint64_t max_size;                     /**< 最大分配大小*/
     uint64_t older_ns;                     /**< 只保留超过该年龄的对象*/
+    uint64_t duration;                     /**< 自动停止时间，单位秒*/
+    int top_n;                              /**< 实时模式显示栈数量*/
+    enum emleak_mode_e mode;               /**< 运行模式*/
 };
 
 struct stack_node {
     int stack_id;                    /* key */
-    int memtimes;                    /*申请的总次数*/
-    int memsum;                      /*call stak memleak的总大小*/
+    uint64_t memtimes;               /*申请的总次数*/
+    uint64_t memsum;                 /*call stak memleak的总大小*/
     UT_hash_handle hh;               /* makes this structure hashable */
 };
 
