@@ -1,0 +1,8 @@
+src/.output/
+src/emleak
+src/mleak_pid*_time*/
+src/record-*.log
+src/test.txt
+*.o
+*.svg
+__pycache__/

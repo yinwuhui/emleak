@@ -45,7 +45,7 @@ eBPF `Uprobe`/`Kprobe`实现用户空间/内核空间的接口捕获，无需改
 实时查看内存增长情况：
 
 ```bash
-sudo ./emleak top -k -i 1 --top 10
+sudo ./emleak top -k -i 1
 ```
 
 只采集并导出数据，不显示实时报告：
@@ -54,7 +54,7 @@ sudo ./emleak top -k -i 1 --top 10
 sudo ./emleak record -k -i 1 --duration 60
 ```
 
-`top` 模式显示当前未释放内存、对象数、分配/释放速率、周期增长量和 Top N 调用栈；`record` 模式沿用现有输出目录和 CSV/栈文件格式。
+`top` 模式显示当前未释放内存、对象数、分配/释放速率、周期增长量和 Top N 调用栈；`record` 模式写入可机器读取的快照、汇总和 FlameGraph folded-stack 数据。
 
 ## 命令参数
 
@@ -79,7 +79,8 @@ OPTS:
     --min-size BYTES  trace allocations at least this size
     --max-size BYTES  trace allocations at most this size
     --older MS        report only allocations older than MS milliseconds
-    --top N            show N stacks in top mode
+    --top N            limit top mode to N rows; default fills the terminal
+	--show-stacks      show resolved stack details below the top table
     --duration SEC     stop record mode after SEC seconds
 
 ./emleak -p 12356
@@ -128,9 +129,11 @@ sudo ./emleak -k --kernel-pages -i 5
                 start_thread+0x2f3;
         、、、、、、、、        
 
-    mleaksummary.csv 保存进程最终的统计信息，包含callstack，内存总量与申请次数;
+    mleaksummary.csv 保存结束时的聚合信息，字段为 tgid、comm、分配类型、callstack、未释放字节和对象数;
 
-    mleakstatics.csv： 保存指定周期（默认10s）进程的内存摘要信息;
+    mleakstatics.csv： 保存每个周期的快照，第一列为纳秒时间戳，随后为 tgid、comm、分配类型、callstack、未释放字节和对象数;
+
+    mleak.folded：结束时生成的 folded stack 文件，可直接传给 flamegraph.pl;
 
 **数据可视化：**
 
@@ -154,7 +157,7 @@ sudo ./emleak -k --kernel-pages -i 5
     #生成内存增长折线图
     python3 ./statisticsdraw.py
     #生成调用栈火焰图
-    ./flamegraph.pl --color=mem --title="malloc() bytes Flame Graph" --countname=bytes < out.stacks > stacks.svg
+    ./flamegraph.pl --color=mem --title="malloc() bytes Flame Graph" --countname=bytes < mleak.folded > stacks.svg
     
 ```
 
