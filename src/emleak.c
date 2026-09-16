@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <limits.h>
+#include <pwd.h>
 
 #define __USE_GNU
 #include <dlfcn.h>
@@ -62,6 +63,69 @@ static uint64_t g_last_alloc_events;
 static uint64_t g_last_free_events;
 static uint64_t g_last_total_bytes;
 static uint64_t g_last_snapshot_ns;
+
+static uint64_t read_meminfo_kb(const char *name)
+{
+	FILE *fp;
+	char line[256];
+	unsigned long long parsed;
+	char key[64];
+
+	fp = fopen("/proc/meminfo", "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		if (sscanf(line, "%63s %llu", key, &parsed) == 2
+				&& strcmp(key, name) == 0) {
+			fclose(fp);
+			return (uint64_t)parsed;
+		}
+	}
+	fclose(fp);
+	return 0;
+}
+
+static void print_system_memory_header(void)
+{
+	FILE *fp;
+	double uptime = 0;
+	double load1 = 0, load5 = 0, load15 = 0;
+	uint64_t mem_total = read_meminfo_kb("MemTotal:");
+	uint64_t mem_free = read_meminfo_kb("MemFree:");
+	uint64_t mem_available = read_meminfo_kb("MemAvailable:");
+	uint64_t buffers = read_meminfo_kb("Buffers:");
+	uint64_t cached = read_meminfo_kb("Cached:");
+	uint64_t swap_total = read_meminfo_kb("SwapTotal:");
+	uint64_t swap_free = read_meminfo_kb("SwapFree:");
+
+	fp = fopen("/proc/uptime", "r");
+	if (fp) {
+		fscanf(fp, "%lf", &uptime);
+		fclose(fp);
+	}
+	fp = fopen("/proc/loadavg", "r");
+	if (fp) {
+		fscanf(fp, "%lf %lf %lf", &load1, &load5, &load15);
+		fclose(fp);
+	}
+
+	printf("up %dd %02d:%02d, load average: %.2f, %.2f, %.2f\n",
+			(int)(uptime / 86400), (int)(uptime / 3600) % 24,
+			(int)(uptime / 60) % 60, load1, load5, load15);
+	printf("Mem : %8.1f MiB total, %8.1f free, %8.1f available, %8.1f buff/cache\n",
+			mem_total / 1024.0, mem_free / 1024.0, mem_available / 1024.0,
+			(buffers + cached) / 1024.0);
+	printf("Swap: %8.1f MiB total, %8.1f free, %8.1f used\n\n",
+			swap_total / 1024.0, swap_free / 1024.0,
+			(swap_total - swap_free) / 1024.0);
+}
+
+static const char *current_user_name(void)
+{
+	struct passwd *user = getpwuid(geteuid());
+
+	return user && user->pw_name ? user->pw_name : "unknown";
+}
 
 pthread_mutex_t g_perf_event_mutex;  /*Avoid  kernel event and user sigfun printing at the same time*/
 
@@ -681,6 +745,9 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 	uint64_t now_ns;
 	uint64_t alloc_delta = 0;
 	uint64_t free_delta = 0;
+	uint64_t mem_total = read_meminfo_kb("MemTotal:");
+	char pid_text[32];
+	const char *command;
 	int shown = 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -691,16 +758,47 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 	}
 
 	printf("\033[H\033[2J");
-	printf("emleak top | mode=%s | interval=%ds\n",
-			cmdparas.trace_kernel ? "kernel" : "user", cmdparas.interval);
-	printf("outstanding: %llu bytes, %llu objects | alloc/s: %llu | free/s: %llu\n",
+	print_system_memory_header();
+	printf("emleak: mode=%s, interval=%ds, target=%s\n",
+			cmdparas.trace_kernel ? "kernel" : "user", cmdparas.interval,
+			cmdparas.trace_kernel
+					? (cmdparas.comm_filter ? cmdparas.prog_comm : "ALL")
+					: (cmdparas.comm_filter ? cmdparas.prog_comm : cmdparas.elffile));
+	printf("captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes\n\n",
+			(unsigned long long)total_bytes, (unsigned long long)object_count,
+			g_last_snapshot_ns ? (long long)((int64_t)total_bytes - (int64_t)g_last_total_bytes) : 0LL);
+	if (cmdparas.trace_kernel) {
+		if (cmdparas.pid)
+			snprintf(pid_text, sizeof(pid_text), "%llu",
+				(unsigned long long)cmdparas.pid);
+		else
+			strncpy(pid_text, "ALL", sizeof(pid_text));
+		command = cmdparas.comm_filter ? cmdparas.prog_comm : "kernel allocations";
+	} else {
+		if (skel->bss->g_emleak_prog.prog_pid)
+			snprintf(pid_text, sizeof(pid_text), "%llu",
+				(unsigned long long)skel->bss->g_emleak_prog.prog_pid);
+		else
+			strncpy(pid_text, "wait", sizeof(pid_text));
+		command = cmdparas.comm_filter ? cmdparas.prog_comm : cmdparas.elffile;
+	}
+	pid_text[sizeof(pid_text) - 1] = '\0';
+	printf(" PID     USER      PR  NI       VIRT       RES       SHR  %%CPU  %%MEM  TIME+ COMMAND\n");
+	printf("%6s  %-8s  %2s  %2s  %9llu  %9lld  %9llu  %5llu  %5.1f  %5llu  %s\n",
+			pid_text, cmdparas.trace_kernel ? "KERNEL" : current_user_name(), "-", "-",
 			(unsigned long long)total_bytes,
+			(long long)(g_last_snapshot_ns
+					? (int64_t)total_bytes - (int64_t)g_last_total_bytes : 0),
 			(unsigned long long)object_count,
 			(unsigned long long)(cmdparas.interval ? alloc_delta / cmdparas.interval : alloc_delta),
-			(unsigned long long)(cmdparas.interval ? free_delta / cmdparas.interval : free_delta));
+			mem_total ? total_bytes / 1024.0 / mem_total * 100.0 : 0.0,
+			(unsigned long long)(cmdparas.interval ? free_delta / cmdparas.interval : free_delta),
+			command);
 	if (g_last_snapshot_ns) {
-		int64_t growth = (int64_t)total_bytes - (int64_t)g_last_total_bytes;
-		printf("period growth: %+lld bytes\n", (long long)growth);
+		printf("\nCaptured status: alloc=%llu, free=%llu, outstanding=%llu bytes\n",
+				(unsigned long long)alloc_delta,
+				(unsigned long long)free_delta,
+				(unsigned long long)total_bytes);
 	}
 	printf("\nTop %d outstanding allocation stacks:\n", cmdparas.top_n);
 	for (node = *stackmaps; node && shown < cmdparas.top_n; node = node->hh.next) {
