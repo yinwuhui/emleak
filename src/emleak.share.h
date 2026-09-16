@@ -10,8 +10,6 @@
 #define PERF_BUFFER_PAGES       16
 #define PERF_POLL_TIMEOUT_MS    100
 
-#define SHOULD_PRINT 1
-#define SAMPLE_EVERY_N 5
 #define USER_STACK_FLAGS (0 | BPF_F_USER_STACK)
 #define KERNEL_STACK_FLAGS 0
 
@@ -39,9 +37,14 @@ enum progstate_e{
 };
 
 struct alloc_info_t {
-        __be64 size;
-        __be64 timestamp_ns;
-        int stack_id;
+	        u64 size;
+	        u64 timestamp_ns;
+	        u64 tgid;
+	        u64 cgroup_id;
+	        s32 stack_id;
+	        u32 tid;
+	        u64 family;
+	        char comm[TASK_COMM_LEN];
 };
 
 struct alloc_key_t {
@@ -55,8 +58,17 @@ struct alloc_ctx_key_t {
 };
 
 struct combined_alloc_info_t {
-        __be64 total_size;
-        __be64 number_of_allocs;
+	        s64 total_size;
+	        s64 number_of_allocs;
+	        u64 allocated_bytes;
+	        u64 freed_bytes;
+};
+
+struct combined_alloc_key_t {
+	        u64 tgid;
+	        u64 family;
+	        s32 stack_id;
+	        char comm[TASK_COMM_LEN];
 };
 
 struct prog_infor_t {
@@ -70,8 +82,12 @@ struct prog_infor_t {
         u64 min_size;                           /**< 最小分配大小*/
         u64 max_size;                           /**< 最大分配大小，0表示不限制*/
         u64 page_size;                           /**< 系统页大小*/
-        u64 alloc_events;                        /**< 已记录的分配事件数*/
-        u64 free_events;                         /**< 已匹配的释放事件数*/
+	        u64 alloc_events;                        /**< 已记录的分配事件数*/
+	        u64 free_events;                         /**< 已匹配的释放事件数*/
+	        u64 alloc_map_failures;                  /**< allocs映射写入失败次数*/
+	        u64 context_map_failures;                /**< 入口上下文映射写入失败次数*/
+	        u64 aggregate_map_failures;              /**< 聚合映射写入失败次数*/
+	        u64 stack_trace_failures;                /**< 调用栈采集失败次数*/
         char prog_comm[TASK_COMM_LEN];         /**< 进程名字*/
         u64 start_time;                        /**< 开始时间*/      
         u64 end_time;                          /**< 结束时间*/

@@ -11,9 +11,16 @@ struct prog_infor_t g_emleak_prog;
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct alloc_ctx_key_t);
-	__type(value, __be64);
+	__type(value, u64);
 	__uint(max_entries, 10240);
 } sizes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct alloc_ctx_key_t);
+	__type(value, u64);
+	__uint(max_entries, 10240);
+} realloc_ptrs SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -24,8 +31,8 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __be64);
-	__type(value, __be64);
+	__type(key, u64);
+	__type(value, u64);
 	__uint(max_entries, 10240);
 } memptrs SEC(".maps");
 
@@ -37,8 +44,8 @@ struct {
 } stack_traces SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __be64);
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, struct combined_alloc_key_t);
 	__type(value, struct combined_alloc_info_t);
 	__uint(max_entries, 10240);
 } combined_allocs SEC(".maps");
@@ -51,7 +58,7 @@ struct {
 
 static inline int user_prog_is_enable()
 {
-    __be64 group_pid = bpf_get_current_pid_tgid() >> 32;
+	    u64 group_pid = bpf_get_current_pid_tgid() >> 32;
 
     if(g_emleak_prog.trace_kernel
             || g_emleak_prog.prog_state != PROG_START_STATE
@@ -112,41 +119,49 @@ static inline int kernel_prog_is_enable()
             && g_emleak_prog.prog_state == PROG_START_STATE;
 }
 
-static inline void update_statistics_add(u64 stack_id, u64 sz) {
-    struct combined_alloc_info_t *existing_cinfo;
-    struct combined_alloc_info_t cinfo = {0};
+static inline void update_statistics(const struct alloc_info_t *info, bool allocation)
+{
+	struct combined_alloc_key_t key = {};
+	struct combined_alloc_info_t *value;
+	struct combined_alloc_info_t initial = {};
 
-    existing_cinfo = bpf_map_lookup_elem(&combined_allocs, &stack_id);
-    if (existing_cinfo != 0){
-        cinfo = *existing_cinfo;
-    }
+	key.tgid = info->tgid;
+	key.family = info->family;
+	key.stack_id = info->stack_id;
+	__builtin_memcpy(key.comm, info->comm, sizeof(key.comm));
+	value = bpf_map_lookup_elem(&combined_allocs, &key);
+	if (!value) {
+		if (bpf_map_update_elem(&combined_allocs, &key, &initial,
+						BPF_NOEXIST) != 0)
+			/* Another CPU may have created the key concurrently. */
+			value = bpf_map_lookup_elem(&combined_allocs, &key);
+		else
+			value = bpf_map_lookup_elem(&combined_allocs, &key);
+		if (!value) {
+			__sync_fetch_and_add(&g_emleak_prog.aggregate_map_failures, 1);
+			return;
+		}
+	}
 
-    cinfo.total_size += sz;
-    cinfo.number_of_allocs += 1;
-
-    bpf_map_update_elem(&combined_allocs, &stack_id, &cinfo, BPF_ANY);
+	if (allocation) {
+		value->total_size += info->size;
+		value->number_of_allocs += 1;
+		value->allocated_bytes += info->size;
+	} else {
+		value->total_size -= info->size;
+		value->number_of_allocs -= 1;
+		value->freed_bytes += info->size;
+	}
 }
 
-static inline void update_statistics_del(u64 stack_id, u64 sz) {
-    struct combined_alloc_info_t *existing_cinfo;
-    struct combined_alloc_info_t cinfo = {0};
+static inline void update_statistics_add(const struct alloc_info_t *info)
+{
+	update_statistics(info, true);
+}
 
-    existing_cinfo = bpf_map_lookup_elem(&combined_allocs, &stack_id);
-    if (existing_cinfo != 0){
-        cinfo = *existing_cinfo;
-    }   
-
-    if (sz >= cinfo.total_size){
-        cinfo.total_size = 0;
-    }else{
-        cinfo.total_size -= sz;
-    }
-
-    if (cinfo.number_of_allocs > 0){
-        cinfo.number_of_allocs -= 1;
-    }
-
-    bpf_map_update_elem(&combined_allocs, &stack_id, &cinfo, BPF_ANY);
+static inline void update_statistics_del(const struct alloc_info_t *info)
+{
+	update_statistics(info, false);
 }
 
 static inline int gen_alloc_enter(size_t size, u64 family) {
@@ -161,19 +176,17 @@ static inline int gen_alloc_enter(size_t size, u64 family) {
         .family = family,
         .pid = bpf_get_current_pid_tgid(),
     };
-    __be64 size64 = size;
-    bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY);
+	u64 size64 = size;
+	if (bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY) != 0) {
+		__sync_fetch_and_add(&g_emleak_prog.context_map_failures, 1);
+		return 0;
+	}
 
-    if (SHOULD_PRINT)
-    {
-        char alloc_fmt[] = "alloc entered, size = %u\\n";
-        bpf_trace_printk(alloc_fmt, sizeof(alloc_fmt), size);  
-    }
-
-    return 0;
+	return 1;
 }
 
-static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u64 family) {
+static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u64 family,
+					  u64 old_address) {
     struct alloc_ctx_key_t size_key = {
         .family = family,
         .pid = bpf_get_current_pid_tgid(),
@@ -185,31 +198,65 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u64 family) 
     u64* size64 = bpf_map_lookup_elem(&sizes, &size_key);
     struct alloc_info_t info = {0};
 
-    if (size64 == 0){
-        return 0; // missed alloc entry
-    }
+	if (size64 == 0){
+		return 0; // missed alloc entry
+	}
 
-    info.size = *size64;
-    bpf_map_delete_elem(&sizes, &size_key);
+	info.size = *size64;
+	bpf_map_delete_elem(&sizes, &size_key);
 
-    if (address != 0) {
-        info.timestamp_ns = bpf_ktime_get_ns();
-        info.stack_id = bpf_get_stackid(ctx, &stack_traces,
-                    g_emleak_prog.trace_kernel ? KERNEL_STACK_FLAGS : USER_STACK_FLAGS);
-        struct alloc_info_t *old_info = bpf_map_lookup_elem(&allocs, &alloc_key);
-        if (old_info != 0)
-            update_statistics_del(old_info->stack_id, old_info->size);
-        bpf_map_update_elem(&allocs, &alloc_key, &info, BPF_ANY);
-        update_statistics_add(info.stack_id, info.size);
-        __sync_fetch_and_add(&g_emleak_prog.alloc_events, 1);
-    }
+	if (address != 0 && address != (__u64)-1) {
+		info.timestamp_ns = bpf_ktime_get_ns();
+		info.tgid = bpf_get_current_pid_tgid() >> 32;
+		info.tid = (u32)bpf_get_current_pid_tgid();
+		info.cgroup_id = bpf_get_current_cgroup_id();
+		info.family = family;
+		bpf_get_current_comm(info.comm, sizeof(info.comm));
+		info.stack_id = bpf_get_stackid(ctx, &stack_traces,
+					g_emleak_prog.trace_kernel ? KERNEL_STACK_FLAGS : USER_STACK_FLAGS);
+		if (info.stack_id < 0)
+			__sync_fetch_and_add(&g_emleak_prog.stack_trace_failures, 1);
+		struct alloc_info_t replaced_info = {};
+		struct alloc_info_t realloc_info = {};
+		int has_replaced = 0;
+		int has_realloc = 0;
+		if (old_address) {
+			struct alloc_key_t old_key = {
+				.family = family,
+				.address = old_address,
+			};
+			struct alloc_info_t *old_info = bpf_map_lookup_elem(&allocs, &old_key);
+			if (old_info) {
+				realloc_info = *old_info;
+				has_realloc = 1;
+			}
+		}
+		struct alloc_info_t *old_info = bpf_map_lookup_elem(&allocs, &alloc_key);
+		if (old_info != 0) {
+			replaced_info = *old_info;
+			has_replaced = 1;
+		}
+		if (bpf_map_update_elem(&allocs, &alloc_key, &info, BPF_ANY) != 0) {
+			__sync_fetch_and_add(&g_emleak_prog.alloc_map_failures, 1);
+			return 0;
+		}
+		if (has_realloc) {
+			update_statistics_del(&realloc_info);
+			if (old_address != address) {
+				struct alloc_key_t old_key = {
+					.family = family,
+					.address = old_address,
+				};
+				bpf_map_delete_elem(&allocs, &old_key);
+			}
+		}
+		if (has_replaced && (!has_realloc || old_address != address))
+			update_statistics_del(&replaced_info);
+		update_statistics_add(&info);
+		__sync_fetch_and_add(&g_emleak_prog.alloc_events, 1);
+	}
 
-    if (SHOULD_PRINT) {
-        char alloc_fmt[] = "alloc exited, size = %lu, result = %lx\\n";
-        bpf_trace_printk(alloc_fmt, sizeof(alloc_fmt), info.size, address);
-    }
-
-    return 0;
+	return 0;
 }
 
 static inline int gen_alloc_exit(struct pt_regs *ctx, u64 family) {
@@ -217,7 +264,27 @@ static inline int gen_alloc_exit(struct pt_regs *ctx, u64 family) {
         return 0;
     }
 
-    return gen_alloc_exit2(ctx, PT_REGS_RC(ctx), family);
+	return gen_alloc_exit2(ctx, PT_REGS_RC(ctx), family, 0);
+}
+
+static inline int gen_realloc_exit(struct pt_regs *ctx)
+{
+	struct alloc_ctx_key_t key = {
+		.family = ALLOC_FAMILY_USER,
+		.pid = bpf_get_current_pid_tgid(),
+	};
+	u64 *old_address;
+	u64 old = 0;
+
+	if (!user_prog_is_enable())
+		return 0;
+	old_address = bpf_map_lookup_elem(&realloc_ptrs, &key);
+	if (old_address) {
+		old = *old_address;
+		bpf_map_delete_elem(&realloc_ptrs, &key);
+	}
+	/* A NULL result leaves the old allocation alive on realloc failure. */
+	return gen_alloc_exit2(ctx, PT_REGS_RC(ctx), ALLOC_FAMILY_USER, old);
 }
 
 static inline int gen_free_enter(struct pt_regs *ctx, void *address, u64 family) {
@@ -229,20 +296,17 @@ static inline int gen_free_enter(struct pt_regs *ctx, void *address, u64 family)
         .family = family,
         .address = (u64)address,
     };
-    struct alloc_info_t *info = bpf_map_lookup_elem(&allocs, &key);
-    if (info == 0){
-        return 0;
-    }
+	struct alloc_info_t *info = bpf_map_lookup_elem(&allocs, &key);
+	struct alloc_info_t old_info;
+	if (info == 0){
+		return 0;
+	}
 
-    bpf_map_delete_elem(&allocs, &key);
+	old_info = *info;
+	bpf_map_delete_elem(&allocs, &key);
 
-    update_statistics_del(info->stack_id, info->size);
-    __sync_fetch_and_add(&g_emleak_prog.free_events, 1);
-
-    if (SHOULD_PRINT) {
-        char free_fmt[] = "free entered, address = %lx, size = %lu\\n";
-        bpf_trace_printk(free_fmt, sizeof(free_fmt), key.address, info->size);
-    }
+	update_statistics_del(&old_info);
+	__sync_fetch_and_add(&g_emleak_prog.free_events, 1);
     
     return 0;
 }
@@ -260,10 +324,11 @@ static inline int gen_kernel_alloc_enter(size_t size, u64 family)
         .family = family,
         .pid = bpf_get_current_pid_tgid(),
     };
-    __be64 size64 = size;
+	u64 size64 = size;
 
-    bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY);
-    return 0;
+	if (bpf_map_update_elem(&sizes, &key, &size64, BPF_ANY) != 0)
+		__sync_fetch_and_add(&g_emleak_prog.context_map_failures, 1);
+	return 0;
 }
 
 static inline int gen_kernel_alloc_exit2(void *ctx, u64 address, u64 family)
@@ -272,7 +337,7 @@ static inline int gen_kernel_alloc_exit2(void *ctx, u64 address, u64 family)
         return 0;
     }
 
-    return gen_alloc_exit2((struct pt_regs *)ctx, address, family);
+	return gen_alloc_exit2((struct pt_regs *)ctx, address, family, 0);
 }
 
 static inline int gen_kernel_free_enter(void *ctx, void *address, u64 family)
@@ -287,13 +352,15 @@ static inline int gen_kernel_free_enter(void *ctx, void *address, u64 family)
         return 0;
     }
 
-    info = bpf_map_lookup_elem(&allocs, &key);
+	info = bpf_map_lookup_elem(&allocs, &key);
     if (info == 0){
         return 0;
     }
 
-    bpf_map_delete_elem(&allocs, &key);
-    update_statistics_del(info->stack_id, info->size);
+	struct alloc_info_t old_info = *info;
+	bpf_map_delete_elem(&allocs, &key);
+	update_statistics_del(&old_info);
+	__sync_fetch_and_add(&g_emleak_prog.free_events, 1);
     return 0;
 }
 
@@ -340,13 +407,23 @@ int realloc_enter(struct pt_regs *ctx) {
     void *ptr = (void *)PT_REGS_PARM1(ctx);
     size_t size = (size_t)PT_REGS_PARM2(ctx);
 
-    gen_free_enter(ctx, ptr, ALLOC_FAMILY_USER);
-    return gen_alloc_enter(size, ALLOC_FAMILY_USER);
+	if (gen_alloc_enter(size, ALLOC_FAMILY_USER)) {
+		struct alloc_ctx_key_t key = {
+			.family = ALLOC_FAMILY_USER,
+			.pid = bpf_get_current_pid_tgid(),
+		};
+		u64 old = (u64)ptr;
+		if (bpf_map_update_elem(&realloc_ptrs, &key, &old, BPF_ANY) != 0) {
+			__sync_fetch_and_add(&g_emleak_prog.context_map_failures, 1);
+			bpf_map_delete_elem(&sizes, &key);
+		}
+	}
+	return 0;
 }
 
 SEC("uretprobe//lib/x86_64-linux-gnu/libc.so.6:realloc")
 int realloc_exit(struct pt_regs *ctx) {
-    return gen_alloc_exit(ctx, ALLOC_FAMILY_USER);
+	return gen_realloc_exit(ctx);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:mmap")
@@ -387,16 +464,17 @@ int posix_memalign_exit(struct pt_regs *ctx) {
     u64 *memptr64 = bpf_map_lookup_elem(&memptrs, &pid);
     void *addr;
 
-    if (memptr64 == 0)
-        return 0;
+	if (memptr64 == 0)
+		return 0;
 
     bpf_map_delete_elem(&memptrs, &pid);
 
-    if (bpf_probe_read_user(&addr, sizeof(void*), (void*)(size_t)*memptr64))
-        return 0;
+	if (PT_REGS_RC(ctx) != 0
+			|| bpf_probe_read_user(&addr, sizeof(void*), (void*)(size_t)*memptr64))
+		return 0;
 
     u64 addr64 = (u64)(size_t)addr;
-    return gen_alloc_exit2(ctx, addr64, ALLOC_FAMILY_USER);
+	return gen_alloc_exit2(ctx, addr64, ALLOC_FAMILY_USER, 0);
 }
 
 SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:aligned_alloc")
