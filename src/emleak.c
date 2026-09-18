@@ -1,5 +1,8 @@
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 #include <bpf/libbpf.h>
@@ -26,6 +29,7 @@
 #include "emleak.share.h"
 #include "procsyms.h"
 #include "emleak.h"
+#include "tui.h"
 #include "emleak.skel.h"
 #include "bcc_syms.h"
 
@@ -88,41 +92,6 @@ static uint64_t read_meminfo_kb(const char *name)
 	}
 	fclose(fp);
 	return 0;
-}
-
-static void print_system_memory_header(void)
-{
-	FILE *fp;
-	double uptime = 0;
-	double load1 = 0, load5 = 0, load15 = 0;
-	uint64_t mem_total = read_meminfo_kb("MemTotal:");
-	uint64_t mem_free = read_meminfo_kb("MemFree:");
-	uint64_t mem_available = read_meminfo_kb("MemAvailable:");
-	uint64_t buffers = read_meminfo_kb("Buffers:");
-	uint64_t cached = read_meminfo_kb("Cached:");
-	uint64_t swap_total = read_meminfo_kb("SwapTotal:");
-	uint64_t swap_free = read_meminfo_kb("SwapFree:");
-
-	fp = fopen("/proc/uptime", "r");
-	if (fp) {
-		fscanf(fp, "%lf", &uptime);
-		fclose(fp);
-	}
-	fp = fopen("/proc/loadavg", "r");
-	if (fp) {
-		fscanf(fp, "%lf %lf %lf", &load1, &load5, &load15);
-		fclose(fp);
-	}
-
-	printf("up %dd %02d:%02d, load average: %.2f, %.2f, %.2f\n",
-			(int)(uptime / 86400), (int)(uptime / 3600) % 24,
-			(int)(uptime / 60) % 60, load1, load5, load15);
-	printf("Mem : %8.1f MiB total, %8.1f free, %8.1f available, %8.1f buff/cache\n",
-			mem_total / 1024.0, mem_free / 1024.0, mem_available / 1024.0,
-			(buffers + cached) / 1024.0);
-	printf("Swap: %8.1f MiB total, %8.1f free, %8.1f used\n\n",
-			swap_total / 1024.0, swap_free / 1024.0,
-			(swap_total - swap_free) / 1024.0);
 }
 
 static const char *__doc__ = 
@@ -495,17 +464,6 @@ int cmp_by_memsum(const struct stack_node *a, const struct stack_node *b) {
 	}
 }
 
-static int top_display_limit(void)
-{
-	struct winsize window = {};
-	int rows = 24;
-
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0 && window.ws_row)
-		rows = window.ws_row;
-	/* System summary, emleak summary, table header, and event status use 10 rows. */
-	return rows > 10 ? rows - 10 : 1;
-}
-
 void p_symbol_init(struct proc_symbol *symbol)
 {
 	memset(symbol, 0x00, sizeof(*symbol));
@@ -834,36 +792,106 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 		uint64_t total_bytes, uint64_t object_count)
 {
 	struct stack_node *node;
-	struct timespec now;
+	struct timespec ts_now;
+	struct tm tm_wall;
+	time_t wall_now;
+	FILE *fp;
+	double uptime = 0, load1 = 0, load5 = 0, load15 = 0;
 	uint64_t now_ns;
 	uint64_t alloc_delta = 0;
 	uint64_t free_delta = 0;
 	uint64_t mem_total = read_meminfo_kb("MemTotal:");
-	int display_limit = cmdparas.top_n ? cmdparas.top_n : top_display_limit();
-	int shown = 0;
+	uint64_t mem_free = read_meminfo_kb("MemFree:");
+	uint64_t mem_available = read_meminfo_kb("MemAvailable:");
+	uint64_t buffers = read_meminfo_kb("Buffers:");
+	uint64_t cached = read_meminfo_kb("Cached:");
+	uint64_t swap_total = read_meminfo_kb("SwapTotal:");
+	uint64_t swap_free = read_meminfo_kb("SwapFree:");
+	const char *target;
+	int days, up_hours, up_mins;
+	int budget, overhead, table_area, stack_rows = 0, limit, shown;
 
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	now_ns = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+	clock_gettime(CLOCK_MONOTONIC, &ts_now);
+	now_ns = (__u64)ts_now.tv_sec * 1000000000ULL + ts_now.tv_nsec;
 	if (g_last_snapshot_ns) {
 		alloc_delta = skel->bss->g_emleak_prog.alloc_events - g_last_alloc_events;
 		free_delta = skel->bss->g_emleak_prog.free_events - g_last_free_events;
 	}
-	printf("\033[H\033[2J");
-	print_system_memory_header();
-	printf("emleak: mode=%s, interval=%ds, target=%s\n",
+
+	fp = fopen("/proc/uptime", "r");
+	if (fp) {
+		fscanf(fp, "%lf", &uptime);
+		fclose(fp);
+	}
+	fp = fopen("/proc/loadavg", "r");
+	if (fp) {
+		fscanf(fp, "%lf %lf %lf", &load1, &load5, &load15);
+		fclose(fp);
+	}
+	wall_now = time(NULL);
+	localtime_r(&wall_now, &tm_wall);
+	days = (int)(uptime / 86400);
+	up_hours = (int)(uptime / 3600) % 24;
+	up_mins = (int)(uptime / 60) % 60;
+
+	target = cmdparas.trace_kernel
+			? (cmdparas.comm_filter ? cmdparas.prog_comm : "ALL")
+			: (cmdparas.comm_filter ? cmdparas.prog_comm : cmdparas.elffile);
+
+	/* reset frame */
+	tui_begin_frame();
+
+	/* header block, top(1) style */
+	if (days > 0)
+		tui_rowf(false, "top - %02d:%02d:%02d up %d day%s, %02d:%02d, load average: %.2f, %.2f, %.2f",
+				tm_wall.tm_hour, tm_wall.tm_min, tm_wall.tm_sec,
+				days, days > 1 ? "s" : "", up_hours, up_mins,
+				load1, load5, load15);
+	else
+		tui_rowf(false, "top - %02d:%02d:%02d up %02d:%02d, load average: %.2f, %.2f, %.2f",
+				tm_wall.tm_hour, tm_wall.tm_min, tm_wall.tm_sec,
+				up_hours, up_mins, load1, load5, load15);
+	tui_rowf(false, "MiB Mem : %8.1f total, %8.1f free, %8.1f avail, %8.1f buff/cache",
+			mem_total / 1024.0, mem_free / 1024.0, mem_available / 1024.0,
+			(buffers + cached) / 1024.0);
+	tui_rowf(false, "MiB Swap: %8.1f total, %8.1f free, %8.1f used",
+			swap_total / 1024.0, swap_free / 1024.0,
+			(swap_total - swap_free) / 1024.0);
+	tui_rowf(false, "emleak: mode=%s, interval=%ds, target=%s",
 			cmdparas.trace_kernel ? "kernel" : "user", cmdparas.interval,
-			cmdparas.trace_kernel
-					? (cmdparas.comm_filter ? cmdparas.prog_comm : "ALL")
-					: (cmdparas.comm_filter ? cmdparas.prog_comm : cmdparas.elffile));
-	printf("captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes\n\n",
+			target);
+	tui_rowf(false, "captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes",
 			(unsigned long long)total_bytes, (unsigned long long)object_count,
 			g_last_snapshot_ns ? (long long)((int64_t)total_bytes - (int64_t)g_last_total_bytes) : 0LL);
-	printf("\033[47;30m    TGID  COMMAND           KIND    OUTSTANDING    ALLOC_TOTAL     FREE_TOTAL    OBJECTS   %%MEM  STACK\033[0m\n");
-	for (node = *stackmaps; node && shown < display_limit; node = node->hh.next) {
+	tui_rowf(false, "");
+
+	/* reserve fixed line counts so every region stays at the same row */
+	budget = tui_height();
+	overhead = 11; /* header(6) + table header + events + health + blank + hint */
+	if (cmdparas.show_stacks) {
+		int want = cmdparas.top_n ? cmdparas.top_n : budget;
+		int max_stack = (budget - overhead) / 2;
+
+		if (max_stack < 1)
+			max_stack = 1;
+		stack_rows = want > max_stack ? max_stack : want;
+		overhead += 1 + stack_rows; /* stacks title + stack lines */
+	}
+	table_area = budget - overhead;
+	if (table_area < 1)
+		table_area = 1;
+	limit = cmdparas.top_n ? cmdparas.top_n : table_area;
+	if (limit > table_area)
+		limit = table_area;
+
+	/* table */
+	tui_rowf(true, "    TGID  COMMAND           KIND    OUTSTANDING    ALLOC_TOTAL     FREE_TOTAL    OBJECTS   %%MEM  STACK");
+	shown = 0;
+	for (node = *stackmaps; node && shown < limit; node = node->hh.next) {
 		const char *kind = node->key.family == ALLOC_FAMILY_KERNEL_PAGE ? "page" :
 			node->key.family == ALLOC_FAMILY_KERNEL_SLAB ? "slab" : "user";
 
-		printf("%8llu  %-16.16s  %-6.6s  %13llu  %13llu  %13llu  %9llu  %5.1f  %d\n",
+		tui_rowf(false, "%8llu  %-16.16s  %-6.6s  %13llu  %13llu  %13llu  %9llu  %5.1f  %d",
 				(unsigned long long)node->key.tgid, node->key.comm, kind,
 				(unsigned long long)node->memsum,
 				(unsigned long long)node->allocated_bytes,
@@ -873,54 +901,68 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 				node->key.stack_id);
 		shown++;
 	}
-	if (g_last_snapshot_ns) {
-		printf("\nCaptured events: alloc=%llu/s, free=%llu/s, outstanding=%llu bytes\n",
-				(unsigned long long)alloc_delta,
-				(unsigned long long)free_delta,
-				(unsigned long long)total_bytes);
-	}
-	if (skel->bss->g_emleak_prog.alloc_map_failures
-			|| skel->bss->g_emleak_prog.context_map_failures
-			|| skel->bss->g_emleak_prog.aggregate_map_failures
-			|| skel->bss->g_emleak_prog.stack_trace_failures)
-		printf("Capture health: alloc-map=%llu context=%llu aggregate=%llu stack=%llu\n",
-				(unsigned long long)skel->bss->g_emleak_prog.alloc_map_failures,
-				(unsigned long long)skel->bss->g_emleak_prog.context_map_failures,
-				(unsigned long long)skel->bss->g_emleak_prog.aggregate_map_failures,
-				(unsigned long long)skel->bss->g_emleak_prog.stack_trace_failures);
-	if (!cmdparas.show_stacks)
-		goto done;
-	printf("\nTop %d outstanding allocation stacks:\n", display_limit);
-	shown = 0;
-	for (node = *stackmaps; node && shown < display_limit; node = node->hh.next) {
-		stack_trace_t stack = {};
-		struct proc_symbol symbol;
+	while (tui_is_active() && shown++ < table_area)
+		tui_rowf(false, "");
 
-		p_symbol_init(&symbol);
-		if (node->key.stack_id >= 0
-				&& bpf_map_lookup_elem(g_stack_traces_fd, &node->key.stack_id, stack) == 0
-				&& stack[0]
-				&& (cmdparas.trace_kernel
-						? kernel_symbol_resolve(stack[0], &symbol) == 0
-						: proc_symbol_resolve(stack[0], &symbol) == 0)) {
-			printf("%2d. %llu bytes, %llu objects, stack=%d, %s+0x%lx",
-					shown + 1, (unsigned long long)node->memsum,
-					(unsigned long long)node->memtimes, node->key.stack_id,
-					symbol.name, symbol.offset);
-			if (cmdparas.trace_kernel && symbol.module[0])
-				printf(" [%s]", symbol.module);
-			printf("\n");
-		} else {
-			printf("%2d. %llu bytes, %llu objects, stack=%d\n",
-					shown + 1, (unsigned long long)node->memsum,
-					(unsigned long long)node->memtimes, node->key.stack_id);
+	/* footer */
+	tui_rowf(false, "Captured events: alloc=%llu/s, free=%llu/s, outstanding=%llu bytes",
+			(unsigned long long)alloc_delta,
+			(unsigned long long)free_delta,
+			(unsigned long long)total_bytes);
+	tui_rowf(false, "Capture health: alloc-map=%llu context=%llu aggregate=%llu stack=%llu",
+			(unsigned long long)skel->bss->g_emleak_prog.alloc_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.context_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.aggregate_map_failures,
+			(unsigned long long)skel->bss->g_emleak_prog.stack_trace_failures);
+	tui_rowf(false, "");
+
+	if (cmdparas.show_stacks) {
+		tui_rowf(false, "Top %d outstanding allocation stacks:", stack_rows);
+		shown = 0;
+		for (node = *stackmaps; node && shown < stack_rows; node = node->hh.next) {
+			stack_trace_t stack = {};
+			struct proc_symbol symbol;
+
+			p_symbol_init(&symbol);
+			if (node->key.stack_id >= 0
+					&& bpf_map_lookup_elem(g_stack_traces_fd, &node->key.stack_id, stack) == 0
+					&& stack[0]
+					&& (cmdparas.trace_kernel
+							? kernel_symbol_resolve(stack[0], &symbol) == 0
+							: proc_symbol_resolve(stack[0], &symbol) == 0)) {
+				char detail[1024];
+
+				snprintf(detail, sizeof(detail), "%s+0x%lx",
+						symbol.name, symbol.offset);
+				if (cmdparas.trace_kernel && symbol.module[0]) {
+					strncat(detail, " [", sizeof(detail) - strlen(detail) - 1);
+					strncat(detail, symbol.module,
+							sizeof(detail) - strlen(detail) - 1);
+					strncat(detail, "]", sizeof(detail) - strlen(detail) - 1);
+				}
+				tui_rowf(false, "%2d. %llu bytes, %llu objects, stack=%d, %s",
+						shown + 1, (unsigned long long)node->memsum,
+						(unsigned long long)node->memtimes, node->key.stack_id,
+						detail);
+			} else {
+				tui_rowf(false, "%2d. %llu bytes, %llu objects, stack=%d",
+						shown + 1, (unsigned long long)node->memsum,
+						(unsigned long long)node->memtimes, node->key.stack_id);
+			}
+			p_symbol_uninit(&symbol);
+			shown++;
 		}
-		p_symbol_uninit(&symbol);
-		shown++;
+		while (tui_is_active() && shown++ < stack_rows)
+			tui_rowf(false, "");
 	}
 
-done:
-	fflush(stdout);
+	if (tui_status_text()[0])
+		tui_rowf(false, "%s", tui_status_text());
+	else
+		tui_rowf(false, "q: quit   Ctrl-C: export and quit");
+
+	/* flush the frame */
+	tui_flush();
 
 	g_last_alloc_events = skel->bss->g_emleak_prog.alloc_events;
 	g_last_free_events = skel->bss->g_emleak_prog.free_events;
@@ -1172,18 +1214,31 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 		old_environment_clean();
 		skel->bss->g_emleak_prog.prog_state = PROG_IDEL_STATE;
 
-		printf("untouch ok pid = %lld.\n", skel->bss->g_emleak_prog.prog_pid);
-	}else if(msg->old_state == PROG_IDEL_STATE 
+		if (cmdparas.mode == EMLEAK_MODE_TOP)
+			tui_statusf("untouch ok pid = %lld.", skel->bss->g_emleak_prog.prog_pid);
+		else
+			printf("untouch ok pid = %lld.\n", skel->bss->g_emleak_prog.prog_pid);
+	}else if(msg->old_state == PROG_IDEL_STATE
 	   			&& msg->new_state == PROG_START_STATE){
 		skel->bss->g_emleak_prog.prog_state = PROG_START_STATE;
 		int pid = skel->bss->g_emleak_prog.prog_pid;
-		printf("touch ok pid = %d.\n", pid);
+
+		if (cmdparas.mode == EMLEAK_MODE_TOP)
+			tui_statusf("touch ok pid = %d.", pid);
+		else
+			printf("touch ok pid = %d.\n", pid);
 
 		int ret = proc_syms_load(pid);
 		if(ret == 0){
-			printf("Loaded successfully, pid = %d...\n", pid);
+			if (cmdparas.mode == EMLEAK_MODE_TOP)
+				tui_statusf("Loaded successfully, pid = %d...", pid);
+			else
+				printf("Loaded successfully, pid = %d...\n", pid);
 		}else{
-			printf("Loaded failed, pid = %d!\n", pid);
+			if (cmdparas.mode == EMLEAK_MODE_TOP)
+				tui_statusf("Loaded failed, pid = %d!", pid);
+			else
+				printf("Loaded failed, pid = %d!\n", pid);
 		}
 		if (attach_user_allocator(skel, pid) != 0)
 			fprintf(stderr, "Failed to attach libc allocation probes for pid %d\n", pid);
@@ -1203,7 +1258,10 @@ static void handle_perf_event(void *ctx, int cpu, void *data, __u32 data_sz)
 
 static void handle_lost_perf_events(void *ctx, int cpu, __u64 lost_cnt)
 {
-	printf("lost %llu events on CPU #%d\n", lost_cnt, cpu);
+	if (cmdparas.mode == EMLEAK_MODE_TOP)
+		tui_statusf("lost %llu events on CPU #%d", lost_cnt, cpu);
+	else
+		printf("lost %llu events on CPU #%d\n", lost_cnt, cpu);
 }
 
 void emleak_signal(int sig)
@@ -1484,6 +1542,8 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, emleak_signal);
 	signal(SIGTERM, emleak_signal);
+	if (cmdparas.mode == EMLEAK_MODE_TOP)
+		tui_enter();
 	if (cmdparas.duration)
 		deadline = time(NULL) + cmdparas.duration;
 	if (cmdparas.interval) {
@@ -1495,6 +1555,10 @@ int main(int argc, char **argv)
 
 	printf("Successfully started! Please run `sudo cat /sys/kernel/debug/tracing/trace_pipe` "
 	       "to see output of the BPF programs.\n");
+
+	/* paint the initial frame right away instead of waiting one interval */
+	if (cmdparas.mode == EMLEAK_MODE_TOP)
+		print_outstanding(NULL, NULL, NULL, 0);
 
 	while(!g_exiting) {
 		if (deadline && time(NULL) >= deadline) {
@@ -1514,6 +1578,8 @@ int main(int argc, char **argv)
 			printf("error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
+		if (tui_poll_quit())
+			g_signal = SIGTERM;
 		if (next_snapshot_ns) {
 			struct timespec now;
 			uint64_t now_ns;
@@ -1539,6 +1605,7 @@ int main(int argc, char **argv)
 			new_msg.new_state = PROG_END_STATE;
 
 			handle_perf_event(NULL, 0 , &new_msg, sizeof(new_msg));
+			tui_leave();
 			printf("Exporting call stack data successfully. outfile[%s,%s,%s]\n",
 			            cmdparas.stackfile, cmdparas.summaryfile, cmdparas.statisticalfile);
 			g_exiting = 1;
@@ -1548,6 +1615,7 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
+	tui_leave();
 	if (g_kernel_syms)
 		bcc_free_symcache(g_kernel_syms, -1);
 	emleak_bpf__destroy(skel);

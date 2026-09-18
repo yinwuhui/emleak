@@ -26,7 +26,7 @@ EXTRA_CFLAGS ?= -Wno-error=discarded-qualifiers
 export EXTRA_CFLAGS
 
 APPS = emleak
-COBJS = 
+COBJS = tui
 CXXOBJS = procsyms
 
 CARGO ?= $(shell which cargo)
@@ -66,12 +66,12 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
 $(call allow-override,CXX,$(CROSS_COMPILE)g++)
 
 .PHONY: all
-all: $(APPS) $(COBJS)
+all: $(APPS)
 
 .PHONY: clean
 clean:
 	$(call msg,CLEAN)
-	$(Q)rm -rf $(OUTPUT) $(APPS) $(COBJS)
+	$(Q)rm -rf $(OUTPUT) $(APPS)
 
 $(OUTPUT) $(OUTPUT)/libbpf $(BPFTOOL_OUTPUT):
 	$(call msg,MKDIR,$@)
@@ -133,9 +133,11 @@ $(patsubst %,$(OUTPUT)/%.o,$(BZS_APPS)): $(LIBBLAZESYM_HEADER)
 $(BZS_APPS): $(LIBBLAZESYM_OBJ)
 
 # Build application binary
-$(APPS): %: $(OUTPUT)/%.o $(OUTPUT)/procsyms.oo $(LIBBPF_OBJ) | $(OUTPUT)
+$(APPS): %: $(OUTPUT)/%.o $(OUTPUT)/procsyms.oo $(patsubst %,$(OUTPUT)/%.o,$(COBJS)) $(LIBBPF_OBJ) | $(OUTPUT)
 	$(call msg,BINARY,$@)
 	$(Q)$(CXX) $(CFLAGS) $^ $(ALL_LDFLAGS) $(ALL_SLIB) -o $@
+
+$(OUTPUT)/emleak.o: tui.h
 
 # delete failed targets
 .DELETE_ON_ERROR:
