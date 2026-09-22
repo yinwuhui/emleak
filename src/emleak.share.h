@@ -62,6 +62,8 @@ struct combined_alloc_info_t {
 	        s64 number_of_allocs;
 	        u64 allocated_bytes;
 	        u64 freed_bytes;
+	        u64 alloc_count;                       /**< 累计分配次数*/
+	        u64 free_count;                        /**< 累计释放次数*/
 };
 
 struct combined_alloc_key_t {

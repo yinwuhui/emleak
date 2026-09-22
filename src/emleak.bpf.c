@@ -147,10 +147,12 @@ static inline void update_statistics(const struct alloc_info_t *info, bool alloc
 		value->total_size += info->size;
 		value->number_of_allocs += 1;
 		value->allocated_bytes += info->size;
+		value->alloc_count += 1;
 	} else {
 		value->total_size -= info->size;
 		value->number_of_allocs -= 1;
 		value->freed_bytes += info->size;
+		value->free_count += 1;
 	}
 }
 
