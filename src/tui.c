@@ -31,10 +31,10 @@
 #define TUI_LINE_MAX 2048
 
 static char tui_frame[TUI_MAX_ROWS][TUI_LINE_MAX];
-static bool tui_frame_inv[TUI_MAX_ROWS];
+static enum tui_row_style tui_frame_style[TUI_MAX_ROWS];
 static int tui_frame_count;
 static char tui_prev_frame[TUI_MAX_ROWS][TUI_LINE_MAX];
-static bool tui_prev_inv[TUI_MAX_ROWS];
+static enum tui_row_style tui_prev_style[TUI_MAX_ROWS];
 static int tui_prev_count;
 static int tui_term_rows = 24;
 static int tui_term_cols = 80;
@@ -76,7 +76,7 @@ const char *tui_status_text(void)
 }
 
 /* append one frame row, truncated to the terminal width */
-void tui_row(const char *text, bool inverse)
+void tui_row(const char *text, enum tui_row_style style)
 {
 	char line[TUI_LINE_MAX];
 	size_t len = strlen(text);
@@ -92,11 +92,11 @@ void tui_row(const char *text, bool inverse)
 		line[tui_term_cols] = '\0';
 
 	strcpy(tui_frame[tui_frame_count], line);
-	tui_frame_inv[tui_frame_count] = inverse && tui_active;
+	tui_frame_style[tui_frame_count] = tui_active ? style : TUI_STYLE_NORMAL;
 	tui_frame_count++;
 }
 
-void tui_rowf(bool inverse, const char *fmt, ...)
+void tui_rowf(enum tui_row_style style, const char *fmt, ...)
 {
 	char line[TUI_LINE_MAX];
 	va_list args;
@@ -104,7 +104,7 @@ void tui_rowf(bool inverse, const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(line, sizeof(line), fmt, args);
 	va_end(args);
-	tui_row(line, inverse);
+	tui_row(line, style);
 }
 
 static void tui_update_winsize(void)
@@ -165,7 +165,7 @@ void tui_flush(void)
 		const char *line = tui_frame[r];
 		size_t n = strlen(line);
 
-		if (r < tui_prev_count && tui_prev_inv[r] == tui_frame_inv[r]
+		if (r < tui_prev_count && tui_prev_style[r] == tui_frame_style[r]
 				&& strcmp(tui_prev_frame[r], line) == 0)
 			continue;
 		while (used + n + 32 > cap) {
@@ -179,11 +179,13 @@ void tui_flush(void)
 			cap *= 2;
 		}
 		used += snprintf(out + used, cap - used, "\033[%d;1H", r + 1);
-		if (tui_frame_inv[r])
+		if (tui_frame_style[r] == TUI_STYLE_HEADER)
 			used += snprintf(out + used, cap - used, "\033[47;30m");
+		else if (tui_frame_style[r] == TUI_STYLE_SELECTED)
+			used += snprintf(out + used, cap - used, "\033[7m");
 		memcpy(out + used, line, n);
 		used += n;
-		if (tui_frame_inv[r])
+		if (tui_frame_style[r] != TUI_STYLE_NORMAL)
 			used += snprintf(out + used, cap - used, "\033[0m");
 		used += snprintf(out + used, cap - used, "\033[K");
 	}
@@ -213,7 +215,7 @@ void tui_flush(void)
 	free(out);
 
 	memcpy(tui_prev_frame, tui_frame, sizeof(tui_prev_frame));
-	memcpy(tui_prev_inv, tui_frame_inv, sizeof(tui_prev_inv));
+	memcpy(tui_prev_style, tui_frame_style, sizeof(tui_prev_style));
 	tui_prev_count = tui_frame_count;
 }
 
@@ -258,18 +260,57 @@ void tui_leave(void)
 	}
 }
 
-bool tui_poll_quit(void)
+enum tui_key tui_poll_key(void)
 {
+	static int seq_len;
+	static struct timespec seq_since;
+	enum tui_key key = TUI_KEY_NONE;
 	char c;
-	bool quit = false;
 
 	if (!tui_active)
-		return false;
+		return TUI_KEY_NONE;
+
 	while (read(STDIN_FILENO, &c, 1) == 1) {
-		if (c == 'q' || c == 'Q') {
-			quit = true;
-			break;
+		if (seq_len == 0) {
+			if (c == 0x1b) {
+				seq_len = 1;
+				clock_gettime(CLOCK_MONOTONIC, &seq_since);
+			} else if (c == 'q' || c == 'Q') {
+				return TUI_KEY_QUIT;
+			} else if (c == '\r' || c == '\n') {
+				return TUI_KEY_ENTER;
+			}
+			continue;
+		}
+		if (seq_len == 1) {
+			if (c == '[' || c == 'O') {
+				seq_len = 2;
+				continue;
+			}
+			seq_len = 0; /* not a recognized sequence, drop the ESC */
+			continue;
+		}
+		/* seq_len == 2: final byte of a CSI/SS3 sequence */
+		seq_len = 0;
+		if (c == 'A')
+			return TUI_KEY_UP;
+		if (c == 'B')
+			return TUI_KEY_DOWN;
+		/* ignore the other finals (right/left/home/...) */
+	}
+
+	if (seq_len == 1) {
+		/* A lone ESC: no '['/'O' byte arrived within 50 ms. Once the
+		 * introducer is seen (seq_len == 2) the final byte is expected
+		 * in the next poll cycle, so no timeout there. */
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if ((now.tv_sec - seq_since.tv_sec) * 1000L +
+				(now.tv_nsec - seq_since.tv_nsec) / 1000000L >= 50) {
+			seq_len = 0;
+			return TUI_KEY_ESC;
 		}
 	}
-	return quit;
+	return key;
 }

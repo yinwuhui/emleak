@@ -42,15 +42,18 @@ struct emleakpara{
     uint64_t duration;                     /**< 自动停止时间，单位秒*/
 	int top_n;                              /**< 实时模式显示栈数量*/
 	int show_stacks;                        /**< 实时模式显示调用栈详情*/
+	int by_stack;                           /**< 实时模式按栈平铺显示(默认按进程折叠)*/
     enum emleak_mode_e mode;               /**< 运行模式*/
 };
 
 struct stack_node {
 	    struct combined_alloc_key_t key; /* owner + allocation stack */
-	    uint64_t memtimes;               /*申请的总次数*/
+	    uint64_t memtimes;               /*当前未释放对象数*/
 	    uint64_t memsum;                 /*call stak memleak的总大小*/
 	    uint64_t allocated_bytes;        /*累计申请字节*/
 	    uint64_t freed_bytes;            /*累计释放字节*/
+	    uint64_t alloc_count;            /*累计申请次数*/
+	    uint64_t free_count;             /*累计释放次数*/
     UT_hash_handle hh;               /* makes this structure hashable */
 };
 

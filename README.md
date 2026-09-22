@@ -56,6 +56,15 @@ sudo ./emleak record -k -i 1 --duration 60
 
 `top` 模式显示当前未释放内存、对象数、分配/释放速率、周期增长量和 Top N 调用栈；`record` 模式写入可机器读取的快照、汇总和 FlameGraph folded-stack 数据。
 
+`top` 模式默认按进程折叠显示（每个进程一行，STACK 列显示该进程的栈数量），交互按键：
+
+*   `↑`/`↓`：选中进程（反色高亮，数据刷新后高亮保持跟随该进程）
+*   `Enter`：展开/收起选中进程的各调用栈明细行
+*   `Esc`：收起展开的栈明细
+*   `q`：退出并导出数据
+
+`--by-stack` 恢复为每个调用栈一行的平铺显示；非终端输出（管道重定向）始终使用平铺显示。
+
 ## 命令参数
 
 > **Note**
@@ -81,6 +90,7 @@ OPTS:
     --older MS        report only allocations older than MS milliseconds
     --top N            limit top mode to N rows; default fills the terminal
 	--show-stacks      show resolved stack details below the top table
+	--by-stack         show one row per stack instead of folding by process
     --duration SEC     stop record mode after SEC seconds
 
 ./emleak -p 12356

@@ -112,6 +112,7 @@ static const char *__doc__ =
 "    --older MS       report only allocations older than MS milliseconds \n"
 	"    --top N          limit top mode to N rows (default fills terminal) \n"
 	"    --show-stacks    show resolved stack details in top mode \n"
+	"    --by-stack       show one row per stack in top mode (default folds by process) \n"
 "    --duration SEC   stop record mode after SEC seconds \n"
 "    -m    set you customized malloc function. ex(-m my_malloc) \n"
 	"    -f    set you customized free function. ex(-m my_free) \n";
@@ -143,6 +144,7 @@ static const struct option long_options[] = {
 	{ "top", required_argument, NULL, 1006 },
 	{ "duration", required_argument, NULL, 1007 },
 	{ "show-stacks", no_argument, NULL, 1008 },
+	{ "by-stack", no_argument, NULL, 1010 },
 	{ "malloc", required_argument, NULL, 'm' },
 	{ "free", required_argument, NULL, 'f' },
 	{}
@@ -416,6 +418,9 @@ int cmd_opts_analytic(int argc, char **argv, struct emleakpara* paras)
 		break;
 	case 1008:
 		paras->show_stacks = 1;
+		break;
+	case 1010:
+		paras->by_stack = 1;
 		break;
 		case 'm':
 			if(strlen(optarg) > MAXFILELEN){
@@ -765,7 +770,8 @@ static void free_stack_nodes(struct stack_node **stackmaps)
 
 static void add_stack_node(struct stack_node **stackmaps,
 		const struct combined_alloc_key_t *key, uint64_t memsize, uint64_t memtimes,
-		uint64_t allocated_bytes, uint64_t freed_bytes) {
+		uint64_t allocated_bytes, uint64_t freed_bytes,
+		uint64_t alloc_count, uint64_t free_count) {
     struct stack_node *s;
 
 	HASH_FIND(hh, *stackmaps, key, sizeof(*key), s);
@@ -778,6 +784,8 @@ static void add_stack_node(struct stack_node **stackmaps,
 		s->memsum = memsize;
 		s->allocated_bytes = allocated_bytes;
 		s->freed_bytes = freed_bytes;
+		s->alloc_count = alloc_count;
+		s->free_count = free_count;
 		HASH_ADD(hh, *stackmaps, key, sizeof(s->key), s);
 		return;
 	}
@@ -786,6 +794,82 @@ static void add_stack_node(struct stack_node **stackmaps,
 	s->memsum += memsize;
 	s->allocated_bytes += allocated_bytes;
 	s->freed_bytes += freed_bytes;
+	s->alloc_count += alloc_count;
+	s->free_count += free_count;
+}
+
+#define TOP_MAX_PROC 1024
+
+struct top_proc {
+	uint64_t tgid;
+	char comm[TASK_COMM_LEN];
+	uint64_t memsum;
+	uint64_t memtimes;
+	uint64_t allocated_bytes;
+	uint64_t freed_bytes;
+	uint64_t alloc_count;
+	uint64_t free_count;
+	int nstacks;
+};
+
+static uint64_t g_sel_tgid;		/* selected process */
+static bool g_sel_valid;		/* g_sel_tgid is meaningful (0 is a
+					   real tgid: kernel self allocs) */
+static uint64_t g_expanded_tgid;	/* expanded process */
+static bool g_exp_valid;		/* g_expanded_tgid is meaningful */
+static uint64_t g_proc_tgids[TOP_MAX_PROC]; /* processes as last rendered */
+static int g_proc_count;
+static bool g_top_skip_accounting;	/* key-triggered re-render leaves the
+					   period accounting untouched */
+
+static int cmp_top_proc_by_memsum(const void *a, const void *b)
+{
+	const struct top_proc *pa = a, *pb = b;
+
+	if (pa->memsum > pb->memsum)
+		return -1;
+	if (pa->memsum == pb->memsum)
+		return 0;
+	return 1;
+}
+
+/* fold the per-stack rows into one summary row per process */
+static int top_fold_procs(const struct stack_node *stackmaps,
+		struct top_proc *procs, int max_procs)
+{
+	const struct stack_node *node;
+	int n = 0;
+
+	for (node = stackmaps; node; node = node->hh.next) {
+		int i;
+
+		for (i = 0; i < n; i++) {
+			if (procs[i].tgid == node->key.tgid) {
+				procs[i].memsum += node->memsum;
+				procs[i].memtimes += node->memtimes;
+				procs[i].allocated_bytes += node->allocated_bytes;
+				procs[i].freed_bytes += node->freed_bytes;
+				procs[i].alloc_count += node->alloc_count;
+				procs[i].free_count += node->free_count;
+				procs[i].nstacks++;
+				break;
+			}
+		}
+		if (i < n || n >= max_procs)
+			continue;
+		procs[n].tgid = node->key.tgid;
+		snprintf(procs[n].comm, sizeof(procs[n].comm), "%s", node->key.comm);
+		procs[n].memsum = node->memsum;
+		procs[n].memtimes = node->memtimes;
+		procs[n].allocated_bytes = node->allocated_bytes;
+		procs[n].freed_bytes = node->freed_bytes;
+		procs[n].alloc_count = node->alloc_count;
+		procs[n].free_count = node->free_count;
+		procs[n].nstacks = 1;
+		n++;
+	}
+	qsort(procs, n, sizeof(*procs), cmp_top_proc_by_memsum);
+	return n;
 }
 
 static void print_top_snapshot(struct stack_node **stackmaps,
@@ -843,27 +927,27 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 
 	/* header block, top(1) style */
 	if (days > 0)
-		tui_rowf(false, "top - %02d:%02d:%02d up %d day%s, %02d:%02d, load average: %.2f, %.2f, %.2f",
+		tui_rowf(TUI_STYLE_NORMAL, "top - %02d:%02d:%02d up %d day%s, %02d:%02d, load average: %.2f, %.2f, %.2f",
 				tm_wall.tm_hour, tm_wall.tm_min, tm_wall.tm_sec,
 				days, days > 1 ? "s" : "", up_hours, up_mins,
 				load1, load5, load15);
 	else
-		tui_rowf(false, "top - %02d:%02d:%02d up %02d:%02d, load average: %.2f, %.2f, %.2f",
+		tui_rowf(TUI_STYLE_NORMAL, "top - %02d:%02d:%02d up %02d:%02d, load average: %.2f, %.2f, %.2f",
 				tm_wall.tm_hour, tm_wall.tm_min, tm_wall.tm_sec,
 				up_hours, up_mins, load1, load5, load15);
-	tui_rowf(false, "MiB Mem : %8.1f total, %8.1f free, %8.1f avail, %8.1f buff/cache",
+	tui_rowf(TUI_STYLE_NORMAL, "MiB Mem : %8.1f total, %8.1f free, %8.1f avail, %8.1f buff/cache",
 			mem_total / 1024.0, mem_free / 1024.0, mem_available / 1024.0,
 			(buffers + cached) / 1024.0);
-	tui_rowf(false, "MiB Swap: %8.1f total, %8.1f free, %8.1f used",
+	tui_rowf(TUI_STYLE_NORMAL, "MiB Swap: %8.1f total, %8.1f free, %8.1f used",
 			swap_total / 1024.0, swap_free / 1024.0,
 			(swap_total - swap_free) / 1024.0);
-	tui_rowf(false, "emleak: mode=%s, interval=%ds, target=%s",
+	tui_rowf(TUI_STYLE_NORMAL, "emleak: mode=%s, interval=%ds, target=%s",
 			cmdparas.trace_kernel ? "kernel" : "user", cmdparas.interval,
 			target);
-	tui_rowf(false, "captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes",
+	tui_rowf(TUI_STYLE_NORMAL, "captured outstanding: %llu bytes, %llu objects, period growth: %+lld bytes",
 			(unsigned long long)total_bytes, (unsigned long long)object_count,
 			g_last_snapshot_ns ? (long long)((int64_t)total_bytes - (int64_t)g_last_total_bytes) : 0LL);
-	tui_rowf(false, "");
+	tui_rowf(TUI_STYLE_NORMAL, "");
 
 	/* reserve fixed line counts so every region stays at the same row */
 	budget = tui_height();
@@ -885,39 +969,106 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 		limit = table_area;
 
 	/* table */
-	tui_rowf(true, "    TGID  COMMAND           KIND    OUTSTANDING    ALLOC_TOTAL     FREE_TOTAL    OBJECTS   %%MEM  STACK");
+	tui_rowf(TUI_STYLE_HEADER, "%8s  %-16s  %-6s  %13s  %17s  %17s  %9s  %5s  %5s",
+			"TGID", "COMMAND", "KIND", "OUTSTANDING", "ALLOC_TOTAL",
+			"FREE_TOTAL", "OBJECTS", "%MEM", "STACK");
 	shown = 0;
-	for (node = *stackmaps; node && shown < limit; node = node->hh.next) {
-		const char *kind = node->key.family == ALLOC_FAMILY_KERNEL_PAGE ? "page" :
-			node->key.family == ALLOC_FAMILY_KERNEL_SLAB ? "slab" : "user";
+	if (cmdparas.by_stack || !tui_is_active()) {
+		for (node = *stackmaps; node && shown < limit; node = node->hh.next) {
+			const char *kind = node->key.family == ALLOC_FAMILY_KERNEL_PAGE ? "page" :
+				node->key.family == ALLOC_FAMILY_KERNEL_SLAB ? "slab" : "user";
+			char alloc_buf[32], free_buf[32];
 
-		tui_rowf(false, "%8llu  %-16.16s  %-6.6s  %13llu  %13llu  %13llu  %9llu  %5.1f  %d",
-				(unsigned long long)node->key.tgid, node->key.comm, kind,
-				(unsigned long long)node->memsum,
-				(unsigned long long)node->allocated_bytes,
-				(unsigned long long)node->freed_bytes,
-				(unsigned long long)node->memtimes,
-				mem_total ? node->memsum / 1024.0 / mem_total * 100.0 : 0.0,
-				node->key.stack_id);
-		shown++;
+			snprintf(alloc_buf, sizeof(alloc_buf), "%llu/%llu",
+					(unsigned long long)node->allocated_bytes,
+					(unsigned long long)node->alloc_count);
+			snprintf(free_buf, sizeof(free_buf), "%llu/%llu",
+					(unsigned long long)node->freed_bytes,
+					(unsigned long long)node->free_count);
+			tui_rowf(TUI_STYLE_NORMAL, "%8llu  %-16.16s  %-6.6s  %13llu  %17s  %17s  %9llu  %5.1f  %d",
+					(unsigned long long)node->key.tgid, node->key.comm, kind,
+					(unsigned long long)node->memsum,
+					alloc_buf, free_buf,
+					(unsigned long long)node->memtimes,
+					mem_total ? node->memsum / 1024.0 / mem_total * 100.0 : 0.0,
+					node->key.stack_id);
+			shown++;
+		}
+	} else {
+		static struct top_proc procs[TOP_MAX_PROC];
+		int nprocs = top_fold_procs(*stackmaps, procs, TOP_MAX_PROC);
+		int p;
+
+		g_proc_count = nprocs;
+		for (p = 0; p < g_proc_count; p++)
+			g_proc_tgids[p] = procs[p].tgid;
+		for (p = 0; p < nprocs && shown < limit; p++) {
+			const struct top_proc *proc = &procs[p];
+			char alloc_buf[32], free_buf[32], nstack_buf[16];
+			enum tui_row_style style = g_sel_valid
+					&& proc->tgid == g_sel_tgid ?
+				TUI_STYLE_SELECTED : TUI_STYLE_NORMAL;
+
+			snprintf(alloc_buf, sizeof(alloc_buf), "%llu/%llu",
+					(unsigned long long)proc->allocated_bytes,
+					(unsigned long long)proc->alloc_count);
+			snprintf(free_buf, sizeof(free_buf), "%llu/%llu",
+					(unsigned long long)proc->freed_bytes,
+					(unsigned long long)proc->free_count);
+			snprintf(nstack_buf, sizeof(nstack_buf), "[%d]", proc->nstacks);
+			tui_rowf(style, "%8llu  %-16.16s  %-6s  %13llu  %17s  %17s  %9llu  %5.1f  %5s",
+					(unsigned long long)proc->tgid, proc->comm, "-",
+					(unsigned long long)proc->memsum,
+					alloc_buf, free_buf,
+					(unsigned long long)proc->memtimes,
+					mem_total ? proc->memsum / 1024.0 / mem_total * 100.0 : 0.0,
+					nstack_buf);
+			shown++;
+			if (!g_exp_valid || g_expanded_tgid != proc->tgid)
+				continue;
+			for (node = *stackmaps; node && shown < limit;
+					node = node->hh.next) {
+				const char *kind;
+
+				if (node->key.tgid != proc->tgid)
+					continue;
+				kind = node->key.family == ALLOC_FAMILY_KERNEL_PAGE ? "page" :
+					node->key.family == ALLOC_FAMILY_KERNEL_SLAB ? "slab" : "user";
+				snprintf(alloc_buf, sizeof(alloc_buf), "%llu/%llu",
+						(unsigned long long)node->allocated_bytes,
+						(unsigned long long)node->alloc_count);
+				snprintf(free_buf, sizeof(free_buf), "%llu/%llu",
+						(unsigned long long)node->freed_bytes,
+						(unsigned long long)node->free_count);
+				tui_rowf(TUI_STYLE_NORMAL,
+						"%8s  %-16s  %-6.6s  %13llu  %17s  %17s  %9llu  %5.1f  %d",
+						"", "", kind,
+						(unsigned long long)node->memsum,
+						alloc_buf, free_buf,
+						(unsigned long long)node->memtimes,
+						mem_total ? node->memsum / 1024.0 / mem_total * 100.0 : 0.0,
+						node->key.stack_id);
+				shown++;
+			}
+		}
 	}
 	while (tui_is_active() && shown++ < table_area)
-		tui_rowf(false, "");
+		tui_rowf(TUI_STYLE_NORMAL, "");
 
 	/* footer */
-	tui_rowf(false, "Captured events: alloc=%llu/s, free=%llu/s, outstanding=%llu bytes",
+	tui_rowf(TUI_STYLE_NORMAL, "Captured events: alloc=%llu/s, free=%llu/s, outstanding=%llu bytes",
 			(unsigned long long)alloc_delta,
 			(unsigned long long)free_delta,
 			(unsigned long long)total_bytes);
-	tui_rowf(false, "Capture health: alloc-map=%llu context=%llu aggregate=%llu stack=%llu",
+	tui_rowf(TUI_STYLE_NORMAL, "Capture health: alloc-map=%llu context=%llu aggregate=%llu stack=%llu",
 			(unsigned long long)skel->bss->g_emleak_prog.alloc_map_failures,
 			(unsigned long long)skel->bss->g_emleak_prog.context_map_failures,
 			(unsigned long long)skel->bss->g_emleak_prog.aggregate_map_failures,
 			(unsigned long long)skel->bss->g_emleak_prog.stack_trace_failures);
-	tui_rowf(false, "");
+	tui_rowf(TUI_STYLE_NORMAL, "");
 
 	if (cmdparas.show_stacks) {
-		tui_rowf(false, "Top %d outstanding allocation stacks:", stack_rows);
+		tui_rowf(TUI_STYLE_NORMAL, "Top %d outstanding allocation stacks:", stack_rows);
 		shown = 0;
 		for (node = *stackmaps; node && shown < stack_rows; node = node->hh.next) {
 			stack_trace_t stack = {};
@@ -940,12 +1091,12 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 							sizeof(detail) - strlen(detail) - 1);
 					strncat(detail, "]", sizeof(detail) - strlen(detail) - 1);
 				}
-				tui_rowf(false, "%2d. %llu bytes, %llu objects, stack=%d, %s",
+				tui_rowf(TUI_STYLE_NORMAL, "%2d. %llu bytes, %llu objects, stack=%d, %s",
 						shown + 1, (unsigned long long)node->memsum,
 						(unsigned long long)node->memtimes, node->key.stack_id,
 						detail);
 			} else {
-				tui_rowf(false, "%2d. %llu bytes, %llu objects, stack=%d",
+				tui_rowf(TUI_STYLE_NORMAL, "%2d. %llu bytes, %llu objects, stack=%d",
 						shown + 1, (unsigned long long)node->memsum,
 						(unsigned long long)node->memtimes, node->key.stack_id);
 			}
@@ -953,21 +1104,25 @@ static void print_top_snapshot(struct stack_node **stackmaps,
 			shown++;
 		}
 		while (tui_is_active() && shown++ < stack_rows)
-			tui_rowf(false, "");
+			tui_rowf(TUI_STYLE_NORMAL, "");
 	}
 
 	if (tui_status_text()[0])
-		tui_rowf(false, "%s", tui_status_text());
+		tui_rowf(TUI_STYLE_NORMAL, "%s", tui_status_text());
+	else if (!cmdparas.by_stack && tui_is_active())
+		tui_rowf(TUI_STYLE_NORMAL, "up/down: select  Enter: expand/collapse  Esc: collapse  q: quit");
 	else
-		tui_rowf(false, "q: quit   Ctrl-C: export and quit");
+		tui_rowf(TUI_STYLE_NORMAL, "q: quit   Ctrl-C: export and quit");
 
 	/* flush the frame */
 	tui_flush();
 
-	g_last_alloc_events = skel->bss->g_emleak_prog.alloc_events;
-	g_last_free_events = skel->bss->g_emleak_prog.free_events;
-	g_last_total_bytes = total_bytes;
-	g_last_snapshot_ns = now_ns;
+	if (!g_top_skip_accounting) {
+		g_last_alloc_events = skel->bss->g_emleak_prog.alloc_events;
+		g_last_free_events = skel->bss->g_emleak_prog.free_events;
+		g_last_total_bytes = total_bytes;
+		g_last_snapshot_ns = now_ns;
+	}
 }
 
 static void collect_old_allocations(struct stack_node **stackmaps,
@@ -990,7 +1145,7 @@ static void collect_old_allocations(struct stack_node **stackmaps,
 			aggregate_key.family = info.family;
 			aggregate_key.stack_id = info.stack_id;
 			memcpy(aggregate_key.comm, info.comm, sizeof(aggregate_key.comm));
-			add_stack_node(stackmaps, &aggregate_key, info.size, 1, info.size, 0);
+			add_stack_node(stackmaps, &aggregate_key, info.size, 1, info.size, 0, 1, 0);
 			*total_bytes += info.size;
 			(*object_count)++;
 		}
@@ -1022,6 +1177,8 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 		int64_t objects = 0;
 		uint64_t allocated_bytes = 0;
 		uint64_t freed_bytes = 0;
+		uint64_t alloc_count = 0;
+		uint64_t free_count = 0;
 
 		if (bpf_map_lookup_elem(g_combined_allocs_fd, &key, values) != 0) {
 			prev_key = key;
@@ -1032,10 +1189,12 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 			objects += values[cpu].number_of_allocs;
 			allocated_bytes += values[cpu].allocated_bytes;
 			freed_bytes += values[cpu].freed_bytes;
+			alloc_count += values[cpu].alloc_count;
+			free_count += values[cpu].free_count;
 		}
 		if (bytes > 0 && objects > 0) {
 			add_stack_node(&stackmaps, &key, bytes, objects,
-					allocated_bytes, freed_bytes);
+					allocated_bytes, freed_bytes, alloc_count, free_count);
 			total_bytes += bytes;
 			object_count += objects;
 		}
@@ -1043,7 +1202,7 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 		}
 		free(values);
 	}
-	
+
 	/*Sort by memory size*/
 	HASH_SORT(stackmaps, cmp_by_memsum);
 	if (cmdparas.mode == EMLEAK_MODE_TOP) {
@@ -1063,6 +1222,70 @@ void print_outstanding(char *stacksfile, char *summaryfile, char *statisticalfil
 	if (islastprint)
 		write_folded_stacks(&stackmaps, cmdparas.foldedfile);
 	free_stack_nodes(&stackmaps);
+}
+
+/* move the process selection by dir (+1/-1), wrapping around the list of
+ * processes as last rendered; dir>0 picks the first process when nothing
+ * is selected yet, dir<0 the last
+ */
+static void top_selection_move(int dir)
+{
+	int i, idx = -1;
+
+	if (g_proc_count <= 0) {
+		g_sel_valid = false;
+		return;
+	}
+	if (g_sel_valid) {
+		for (i = 0; i < g_proc_count; i++) {
+			if (g_proc_tgids[i] == g_sel_tgid) {
+				idx = i;
+				break;
+			}
+		}
+	}
+	if (idx < 0) {
+		idx = dir > 0 ? 0 : g_proc_count - 1;
+	} else {
+		idx = (idx + dir + g_proc_count) % g_proc_count;
+	}
+	g_sel_tgid = g_proc_tgids[idx];
+	g_sel_valid = true;
+}
+
+/* Enter: nothing selected -> select first process; the selected process is
+ * expanded -> collapse it, otherwise expand it
+ */
+static void top_selection_toggle(void)
+{
+	if (g_proc_count <= 0)
+		return;
+	if (!g_sel_valid) {
+		g_sel_tgid = g_proc_tgids[0];
+		g_sel_valid = true;
+		return;
+	}
+	if (g_exp_valid && g_expanded_tgid == g_sel_tgid) {
+		g_exp_valid = false;
+	} else {
+		g_expanded_tgid = g_sel_tgid;
+		g_exp_valid = true;
+	}
+}
+
+static void top_selection_collapse(void)
+{
+	g_exp_valid = false;
+}
+
+/* re-render the current snapshot immediately after a key press, without
+ * waiting for the next interval and without touching period accounting
+ */
+static void top_render_request(void)
+{
+	g_top_skip_accounting = true;
+	print_outstanding(NULL, NULL, NULL, 0);
+	g_top_skip_accounting = false;
 }
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -1578,8 +1801,37 @@ int main(int argc, char **argv)
 			printf("error polling perf buffer: %s\n", strerror(-err));
 			goto cleanup;
 		}
-		if (tui_poll_quit())
-			g_signal = SIGTERM;
+		{
+			enum tui_key key = tui_poll_key();
+			bool rerender = false;
+
+			switch (key) {
+			case TUI_KEY_QUIT:
+				g_signal = SIGTERM;
+				break;
+			case TUI_KEY_UP:
+				top_selection_move(-1);
+				rerender = true;
+				break;
+			case TUI_KEY_DOWN:
+				top_selection_move(1);
+				rerender = true;
+				break;
+			case TUI_KEY_ENTER:
+				top_selection_toggle();
+				rerender = true;
+				break;
+			case TUI_KEY_ESC:
+				top_selection_collapse();
+				rerender = true;
+				break;
+			default:
+				break;
+			}
+			if (rerender && cmdparas.mode == EMLEAK_MODE_TOP
+					&& !cmdparas.by_stack && tui_is_active())
+				top_render_request();
+		}
 		if (next_snapshot_ns) {
 			struct timespec now;
 			uint64_t now_ns;
